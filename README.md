@@ -332,3 +332,7 @@ fn validate_user(json: String) -> Bool:
 ## License
 
 MIT License
+
+## Part of mojo-contrib
+
+This library is part of [mojo-contrib](https://github.com/atsentia/mojo-contrib), a collection of pure Mojo libraries.
