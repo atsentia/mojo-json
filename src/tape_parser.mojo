@@ -39,7 +39,7 @@ alias TAPE_NULL: UInt8 = ord('n')
 
 alias PAYLOAD_MASK: UInt64 = 0x00FFFFFFFFFFFFFF
 
-from memory import bitcast
+from memory import bitcast, ArcPointer
 
 
 @always_inline
@@ -739,13 +739,16 @@ fn parse_fast(json: String) raises -> JsonValue:
 # =============================================================================
 
 
-struct LazyJsonValue(Movable, Stringable):
+struct LazyJsonValue(Movable, Copyable, Stringable):
     """
     Lazy JSON value that parses only when accessed.
 
     PERFORMANCE: This maintains the 300-886 MB/s parse speed by deferring
     JsonValue tree construction. Values are only parsed when explicitly
     accessed via get(), as_string(), as_int(), etc.
+
+    ZERO-COPY: Uses ArcPointer for shared tape ownership. Nested access
+    (get_object_value, get_array_element) shares the same tape without copying.
 
     Example:
         var lazy = parse_lazy('{"users": [...huge array...], "count": 42}')
@@ -759,21 +762,35 @@ struct LazyJsonValue(Movable, Stringable):
         parse_lazy() - ~500 MB/s (tape only, on-demand)
     """
 
-    var _tape: JsonTape
-    """The tape containing all JSON data."""
+    var _tape: ArcPointer[JsonTape]
+    """Shared reference to the tape containing all JSON data."""
 
     var _idx: Int
     """Index in tape for this value."""
 
     fn __init__(out self, var tape: JsonTape, idx: Int = 1):
         """Create lazy value from tape at given index."""
-        self._tape = tape^
+        self._tape = ArcPointer(tape^)
         self._idx = idx
+
+    fn __init__(out self, tape_arc: ArcPointer[JsonTape], idx: Int):
+        """Create lazy value sharing existing tape reference."""
+        self._tape = tape_arc
+        self._idx = idx
+
+    fn __copyinit__(out self, other: Self):
+        """Copy constructor - shares tape reference."""
+        self._tape = other._tape
+        self._idx = other._idx
 
     fn __moveinit__(out self, deinit other: Self):
         """Move constructor."""
         self._tape = other._tape^
         self._idx = other._idx
+
+    fn copy(self) -> Self:
+        """Create explicit copy (shares tape reference via ArcPointer)."""
+        return LazyJsonValue(self._tape, self._idx)
 
     # =========================================================================
     # Type Checking (O(1) - no parsing needed)
@@ -782,9 +799,9 @@ struct LazyJsonValue(Movable, Stringable):
     @always_inline
     fn type_tag(self) -> UInt8:
         """Get tape type tag."""
-        if self._idx >= len(self._tape):
+        if self._idx >= len(self._tape[]):
             return TAPE_NULL
-        return self._tape.get_entry(self._idx).type_tag()
+        return self._tape[].get_entry(self._idx).type_tag()
 
     fn is_null(self) -> Bool:
         return self.type_tag() == TAPE_NULL
@@ -823,28 +840,52 @@ struct LazyJsonValue(Movable, Stringable):
     fn as_int(self) -> Int64:
         """Get integer value. Returns 0 for non-integers."""
         if self.type_tag() == TAPE_INT64:
-            return self._tape.get_int64(self._idx)
+            return self._tape[].get_int64(self._idx)
         elif self.type_tag() == TAPE_DOUBLE:
-            return Int64(self._tape.get_double(self._idx))
+            return Int64(self._tape[].get_double(self._idx))
         return 0
 
     fn as_float(self) -> Float64:
         """Get float value. Returns 0.0 for non-numbers."""
         if self.type_tag() == TAPE_DOUBLE:
-            return self._tape.get_double(self._idx)
+            return self._tape[].get_double(self._idx)
         elif self.type_tag() == TAPE_INT64:
-            return Float64(self._tape.get_int64(self._idx))
+            return Float64(self._tape[].get_int64(self._idx))
         return 0.0
 
     fn as_string(self) -> String:
         """Get string value. Returns empty string for non-strings."""
         if self.type_tag() == TAPE_STRING:
-            var offset = self._tape.get_entry(self._idx).payload()
-            return self._tape.get_string(offset)
+            var offset = self._tape[].get_entry(self._idx).payload()
+            return self._tape[].get_string(offset)
         return String("")
 
     # =========================================================================
-    # Container Access
+    # Subscript Operators (Ergonomic API)
+    # =========================================================================
+
+    fn __getitem__(self, key: String) -> LazyJsonValue:
+        """
+        Get object value by key using subscript notation.
+
+        Example:
+            var lazy = parse_lazy('{"user": {"name": "Alice"}}')
+            var name = lazy["user"]["name"].as_string()  # "Alice"
+        """
+        return self.get_object_value(key)
+
+    fn __getitem__(self, index: Int) -> LazyJsonValue:
+        """
+        Get array element by index using subscript notation.
+
+        Example:
+            var lazy = parse_lazy('[1, 2, 3]')
+            var second = lazy[1].as_int()  # 2
+        """
+        return self.get_array_element(index)
+
+    # =========================================================================
+    # Container Access (Zero-Copy with ArcPointer)
     # =========================================================================
 
     fn len(self) -> Int:
@@ -853,7 +894,7 @@ struct LazyJsonValue(Movable, Stringable):
         if tag != TAPE_START_ARRAY and tag != TAPE_START_OBJECT:
             return 0
 
-        var end_idx = self._tape.get_entry(self._idx).payload()
+        var end_idx = self._tape[].get_entry(self._idx).payload()
         var count = 0
         var pos = self._idx + 1
 
@@ -861,8 +902,8 @@ struct LazyJsonValue(Movable, Stringable):
             count += 1
             # Skip key for objects
             if tag == TAPE_START_OBJECT:
-                pos = self._tape.skip_value(pos)  # Skip key
-            pos = self._tape.skip_value(pos)  # Skip value
+                pos = self._tape[].skip_value(pos)  # Skip key
+            pos = self._tape[].skip_value(pos)  # Skip value
 
         return count
 
@@ -870,7 +911,7 @@ struct LazyJsonValue(Movable, Stringable):
         """
         Get array element by index.
 
-        PERF: Scans from start - O(index) time.
+        PERF: O(index) scan time, but ZERO-COPY - shares tape via ArcPointer.
         For repeated access, convert to JsonValue or use tape directly.
         """
         if self.type_tag() != TAPE_START_ARRAY:
@@ -881,16 +922,15 @@ struct LazyJsonValue(Movable, Stringable):
             empty_tape.finalize()
             return LazyJsonValue(empty_tape^, 1)
 
-        var end_idx = self._tape.get_entry(self._idx).payload()
+        var end_idx = self._tape[].get_entry(self._idx).payload()
         var pos = self._idx + 1
         var current_idx = 0
 
         while pos < end_idx:
             if current_idx == index:
-                # Found it - create new lazy value at this position
-                # We need to copy the tape since we can't share references
-                return self._create_at_index(pos)
-            pos = self._tape.skip_value(pos)
+                # Found it - share tape reference (zero-copy!)
+                return LazyJsonValue(self._tape, pos)
+            pos = self._tape[].skip_value(pos)
             current_idx += 1
 
         # Out of bounds
@@ -904,7 +944,7 @@ struct LazyJsonValue(Movable, Stringable):
         """
         Get object value by key.
 
-        PERF: Scans keys linearly - O(n) where n = number of keys.
+        PERF: O(n) key scan, but ZERO-COPY - shares tape via ArcPointer.
         For repeated access, convert to JsonValue.
         """
         if self.type_tag() != TAPE_START_OBJECT:
@@ -914,23 +954,23 @@ struct LazyJsonValue(Movable, Stringable):
             empty_tape.finalize()
             return LazyJsonValue(empty_tape^, 1)
 
-        var end_idx = self._tape.get_entry(self._idx).payload()
+        var end_idx = self._tape[].get_entry(self._idx).payload()
         var pos = self._idx + 1
 
         while pos < end_idx:
             # Read key
-            var key_entry = self._tape.get_entry(pos)
+            var key_entry = self._tape[].get_entry(pos)
             if key_entry.type_tag() == TAPE_STRING:
                 var key_offset = key_entry.payload()
-                var found_key = self._tape.get_string(key_offset)
+                var found_key = self._tape[].get_string(key_offset)
                 pos += 1  # Move past key
 
                 if found_key == key:
-                    # Found it!
-                    return self._create_at_index(pos)
+                    # Found it - share tape reference (zero-copy!)
+                    return LazyJsonValue(self._tape, pos)
 
                 # Skip value
-                pos = self._tape.skip_value(pos)
+                pos = self._tape[].skip_value(pos)
             else:
                 pos += 1
 
@@ -940,23 +980,6 @@ struct LazyJsonValue(Movable, Stringable):
         empty_tape.append_null()
         empty_tape.finalize()
         return LazyJsonValue(empty_tape^, 1)
-
-    fn _create_at_index(self, pos: Int) -> LazyJsonValue:
-        """Create lazy value viewing tape at given position."""
-        # We need to copy the tape to create a new lazy value
-        # This is a limitation - could be optimized with Arc<> or similar
-        var new_tape = JsonTape(capacity=len(self._tape))
-        new_tape.source = self._tape.source
-
-        # Copy entries
-        for i in range(len(self._tape.entries)):
-            new_tape.entries.append(self._tape.entries[i])
-
-        # Copy string buffer
-        for i in range(len(self._tape.string_buffer)):
-            new_tape.string_buffer.append(self._tape.string_buffer[i])
-
-        return LazyJsonValue(new_tape^, pos)
 
     # =========================================================================
     # Conversion (Full Parse)
@@ -978,38 +1001,38 @@ struct LazyJsonValue(Movable, Stringable):
         elif tag == TAPE_FALSE:
             return JsonValue.from_bool(False)
         elif tag == TAPE_INT64:
-            return JsonValue.from_int(self._tape.get_int64(self._idx))
+            return JsonValue.from_int(self._tape[].get_int64(self._idx))
         elif tag == TAPE_DOUBLE:
-            return JsonValue.from_float(self._tape.get_double(self._idx))
+            return JsonValue.from_float(self._tape[].get_double(self._idx))
         elif tag == TAPE_STRING:
-            var offset = self._tape.get_entry(self._idx).payload()
-            return JsonValue.from_string(self._tape.get_string(offset))
+            var offset = self._tape[].get_entry(self._idx).payload()
+            return JsonValue.from_string(self._tape[].get_string(offset))
         elif tag == TAPE_START_ARRAY:
             var arr = List[JsonValue](capacity=8)
-            var end_idx = self._tape.get_entry(self._idx).payload()
+            var end_idx = self._tape[].get_entry(self._idx).payload()
             var pos = self._idx + 1
 
             while pos < end_idx:
                 var elem = self._convert_at(pos)
                 arr.append(elem^)
-                pos = self._tape.skip_value(pos)
+                pos = self._tape[].skip_value(pos)
 
             return JsonValue.from_array_move(arr^)
         elif tag == TAPE_START_OBJECT:
             var obj = Dict[String, JsonValue]()
-            var end_idx = self._tape.get_entry(self._idx).payload()
+            var end_idx = self._tape[].get_entry(self._idx).payload()
             var pos = self._idx + 1
 
             while pos < end_idx:
-                var key_entry = self._tape.get_entry(pos)
+                var key_entry = self._tape[].get_entry(pos)
                 if key_entry.type_tag() == TAPE_STRING:
                     var key_offset = key_entry.payload()
-                    var key = self._tape.get_string(key_offset)
+                    var key = self._tape[].get_string(key_offset)
                     pos += 1
 
                     var val = self._convert_at(pos)
                     obj[key] = val^
-                    pos = self._tape.skip_value(pos)
+                    pos = self._tape[].skip_value(pos)
                 else:
                     pos += 1
 
@@ -1019,7 +1042,7 @@ struct LazyJsonValue(Movable, Stringable):
 
     fn _convert_at(self, pos: Int) -> JsonValue:
         """Convert value at tape position to JsonValue."""
-        var entry = self._tape.get_entry(pos)
+        var entry = self._tape[].get_entry(pos)
         var tag = entry.type_tag()
 
         if tag == TAPE_NULL:
@@ -1029,12 +1052,12 @@ struct LazyJsonValue(Movable, Stringable):
         elif tag == TAPE_FALSE:
             return JsonValue.from_bool(False)
         elif tag == TAPE_INT64:
-            return JsonValue.from_int(self._tape.get_int64(pos))
+            return JsonValue.from_int(self._tape[].get_int64(pos))
         elif tag == TAPE_DOUBLE:
-            return JsonValue.from_float(self._tape.get_double(pos))
+            return JsonValue.from_float(self._tape[].get_double(pos))
         elif tag == TAPE_STRING:
             var offset = entry.payload()
-            return JsonValue.from_string(self._tape.get_string(offset))
+            return JsonValue.from_string(self._tape[].get_string(offset))
         elif tag == TAPE_START_ARRAY:
             var arr = List[JsonValue](capacity=8)
             var end_idx = entry.payload()
@@ -1043,7 +1066,7 @@ struct LazyJsonValue(Movable, Stringable):
             while inner_pos < end_idx:
                 var elem = self._convert_at(inner_pos)
                 arr.append(elem^)
-                inner_pos = self._tape.skip_value(inner_pos)
+                inner_pos = self._tape[].skip_value(inner_pos)
 
             return JsonValue.from_array_move(arr^)
         elif tag == TAPE_START_OBJECT:
@@ -1052,15 +1075,15 @@ struct LazyJsonValue(Movable, Stringable):
             var inner_pos = pos + 1
 
             while inner_pos < end_idx:
-                var key_entry = self._tape.get_entry(inner_pos)
+                var key_entry = self._tape[].get_entry(inner_pos)
                 if key_entry.type_tag() == TAPE_STRING:
                     var key_offset = key_entry.payload()
-                    var key = self._tape.get_string(key_offset)
+                    var key = self._tape[].get_string(key_offset)
                     inner_pos += 1
 
                     var val = self._convert_at(inner_pos)
                     obj[key] = val^
-                    inner_pos = self._tape.skip_value(inner_pos)
+                    inner_pos = self._tape[].skip_value(inner_pos)
                 else:
                     inner_pos += 1
 
