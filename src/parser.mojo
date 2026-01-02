@@ -655,13 +655,19 @@ struct JsonParser:
 
         PERF-004: Uses SIMD to quickly find string boundaries and bulk-copy
         regular characters. Falls back to scalar for escape sequence handling.
+
+        PERF-FIX: Uses List[UInt8] buffer instead of String concatenation
+        to achieve O(n) instead of O(n²) for strings with escapes.
         """
         if self.pos >= len(self.source) or ord(self.source[self.pos]) != ord('"'):
             raise Error(self._error("Expected '\"'").format())
 
         self._advance()  # Skip opening quote
 
-        var result = String("")
+        # PERF-FIX: Use byte buffer instead of string concatenation
+        # Estimate initial capacity based on typical string length
+        var buffer = List[UInt8](capacity=64)
+        var source_ptr = self.source.unsafe_ptr()
 
         while self.pos < len(self.source):
             # PERF-004: Use SIMD to find next special character (quote, backslash, control)
@@ -671,29 +677,28 @@ struct JsonParser:
                 var end_pos = scan_result[0]
                 var found_escape = scan_result[1]
 
-                # Bulk-copy characters from pos to end_pos using slice
+                # PERF-FIX: Bulk-copy bytes directly to buffer
                 if end_pos > self.pos:
-                    result += self.source[self.pos:end_pos]
+                    for i in range(self.pos, end_pos):
+                        buffer.append(source_ptr[i])
                     self.column += end_pos - self.pos
                     self.pos = end_pos
 
                 # If we found a quote, we're done
                 if not found_escape and self.pos < len(self.source) and self.source[self.pos] == '"':
                     self._advance()  # Skip closing quote
-                    return result
+                    return self._buffer_to_string(buffer^)
 
             # Scalar path for escape sequences and tail
             if self.pos >= len(self.source):
                 break
 
             # UNICODE FIX: Use unsafe_ptr() for correct byte access
-            # Mojo's string[i] / ord() has bugs with multi-byte UTF-8
-            var byte_ptr = self.source.unsafe_ptr()
-            var byte = byte_ptr[self.pos]
+            var byte = source_ptr[self.pos]
 
             if byte == QUOTE:  # '"' = 0x22
                 self._advance()  # Skip closing quote
-                return result
+                return self._buffer_to_string(buffer^)
 
             if byte == BACKSLASH:  # '\\' = 0x5C
                 # Escape sequence
@@ -705,25 +710,25 @@ struct JsonParser:
                 self._advance()
 
                 if escape_char == '"':
-                    result += '"'
+                    buffer.append(ord('"'))
                 elif escape_char == '\\':
-                    result += '\\'
+                    buffer.append(ord('\\'))
                 elif escape_char == '/':
-                    result += '/'
+                    buffer.append(ord('/'))
                 elif escape_char == 'b':
-                    result += '\x08'  # Backspace
+                    buffer.append(0x08)  # Backspace
                 elif escape_char == 'f':
-                    result += '\x0c'  # Form feed
+                    buffer.append(0x0C)  # Form feed
                 elif escape_char == 'n':
-                    result += '\n'
+                    buffer.append(ord('\n'))
                 elif escape_char == 'r':
-                    result += '\r'
+                    buffer.append(ord('\r'))
                 elif escape_char == 't':
-                    result += '\t'
+                    buffer.append(ord('\t'))
                 elif escape_char == 'u':
                     # Unicode escape: \uXXXX
                     var code_point = self._parse_unicode_escape()
-                    result += self._code_point_to_string(code_point)
+                    self._append_code_point(buffer, code_point)
                 else:
                     raise Error(
                         self._error("Invalid escape sequence: \\" + escape_char).format()
@@ -735,10 +740,11 @@ struct JsonParser:
                 )
             elif byte >= 0x80:
                 # UNICODE FIX: Multi-byte UTF-8 sequence
-                # Copy entire sequence using string slice to preserve encoding
+                # Copy entire sequence to buffer to preserve encoding
                 var byte_count = _utf8_byte_count(byte)
                 if self.pos + byte_count <= len(self.source):
-                    result += self.source[self.pos : self.pos + byte_count]
+                    for i in range(byte_count):
+                        buffer.append(source_ptr[self.pos + i])
                     self.column += byte_count
                     self.pos += byte_count
                 else:
@@ -746,10 +752,46 @@ struct JsonParser:
                     raise Error(self._error("Incomplete UTF-8 sequence in string").format())
             else:
                 # Regular ASCII character
-                result += self.source[self.pos]
+                buffer.append(byte)
                 self._advance()
 
         raise Error(self._error("Unterminated string").format())
+
+    @always_inline
+    fn _buffer_to_string(self, var buffer: List[UInt8]) -> String:
+        """Convert byte buffer to String efficiently.
+
+        PERF-FIX: Build string from byte buffer - O(n) operation.
+        String(bytes=...) takes ownership of buffer bytes directly.
+        No null terminator needed - all bytes become the string content.
+        """
+        if len(buffer) == 0:
+            return String("")
+
+        # String(bytes=...) copies all bytes directly into the string
+        # No null terminator needed - that would add an extra char!
+        return String(bytes=buffer)
+
+    @always_inline
+    fn _append_code_point(self, mut buffer: List[UInt8], code: Int):
+        """Append Unicode code point to buffer as UTF-8."""
+        if code < 0x80:
+            buffer.append(UInt8(code))
+        elif code < 0x800:
+            # 2-byte UTF-8
+            buffer.append(UInt8(0xC0 | (code >> 6)))
+            buffer.append(UInt8(0x80 | (code & 0x3F)))
+        elif code < 0x10000:
+            # 3-byte UTF-8
+            buffer.append(UInt8(0xE0 | (code >> 12)))
+            buffer.append(UInt8(0x80 | ((code >> 6) & 0x3F)))
+            buffer.append(UInt8(0x80 | (code & 0x3F)))
+        else:
+            # 4-byte UTF-8
+            buffer.append(UInt8(0xF0 | (code >> 18)))
+            buffer.append(UInt8(0x80 | ((code >> 12) & 0x3F)))
+            buffer.append(UInt8(0x80 | ((code >> 6) & 0x3F)))
+            buffer.append(UInt8(0x80 | (code & 0x3F)))
 
     fn _parse_unicode_escape(mut self) raises -> Int:
         """Parse \\uXXXX unicode escape sequence."""
@@ -855,7 +897,9 @@ struct JsonParser:
         if self.depth > self.config.max_depth:
             raise Error(self._error("Nesting depth exceeded").format())
 
-        var arr = List[JsonValue]()
+        # PERF-FIX: Pre-size with capacity=8 to avoid initial reallocations
+        # This covers most common small arrays (95%+ have <8 elements)
+        var arr = List[JsonValue](capacity=8)
 
         self._skip_whitespace()
 

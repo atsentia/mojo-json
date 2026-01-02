@@ -359,6 +359,37 @@ struct JsonValue(Copyable, Movable, Stringable):
         return Dict[String, JsonValue]()
 
     # ============================================================
+    # PERF: Reference accessors (zero-copy access)
+    # ============================================================
+
+    @always_inline
+    fn string_ref(ref [_] self) -> ref [self._string_val] String:
+        """Get reference to string value without copying.
+
+        PERF-FIX: Returns reference instead of copy.
+        Caller must ensure is_string() is True.
+        """
+        return self._string_val
+
+    @always_inline
+    fn array_ref(ref [_] self) -> ref [self._array_val] List[JsonValue]:
+        """Get reference to array value without copying.
+
+        PERF-FIX: Returns reference instead of copy.
+        Caller must ensure is_array() is True.
+        """
+        return self._array_val
+
+    @always_inline
+    fn object_ref(ref [_] self) -> ref [self._object_val] Dict[String, JsonValue]:
+        """Get reference to object value without copying.
+
+        PERF-FIX: Returns reference instead of copy.
+        Caller must ensure is_object() is True.
+        """
+        return self._object_val
+
+    # ============================================================
     # Array operations (convenience)
     # ============================================================
 
