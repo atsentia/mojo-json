@@ -1,0 +1,15 @@
+[project]
+name = "mojo-json"
+version = "0.1.0"
+description = "Pure Mojo JSON parsing and serialization library"
+authors = ["IDEA2CODE"]
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+max = ">=24.6,<25"
+
+[tasks]
+build = "mojo build src/__init__.mojo -o json"
+test = "mojo test tests/"
+format = "mojo format src/ tests/"
