@@ -331,7 +331,7 @@ fn validate_user(json: String) -> Bool:
 
 ## License
 
-MIT License
+Apache 2.0 License
 
 ## Part of mojo-contrib
 
