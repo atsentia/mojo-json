@@ -8,13 +8,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Mojo
-        uses: modular/setup-mojo@v1
-        
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Mojo (official method)
+        run: |
+          pip install mojo --extra-index-url https://modular.gateway.scarf.sh/simple/
+          mojo --version
+
       - name: Run tests
         run: |
           for test_file in tests/test_*.mojo; do
@@ -23,6 +30,6 @@ jobs:
               mojo run "$test_file"
             fi
           done
-          
+
       - name: Check formatting
         run: mojo format --check src/
