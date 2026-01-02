@@ -42,6 +42,57 @@ alias PAYLOAD_MASK: UInt64 = 0x00FFFFFFFFFFFFFF
 from memory import bitcast
 
 
+@always_inline
+fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
+    """Fast integer parsing with SIMD acceleration for 8+ digit numbers."""
+    var pos = start
+    var negative = False
+    var result: Int64 = 0
+
+    # Handle sign
+    if ptr[pos] == ord('-'):
+        negative = True
+        pos += 1
+    elif ptr[pos] == ord('+'):
+        pos += 1
+
+    var digit_count = end - pos
+
+    # SIMD path for 8+ digits
+    if digit_count >= 8:
+        # Load 8 bytes
+        var chunk = SIMD[DType.uint8, 8]()
+        @parameter
+        for i in range(8):
+            chunk[i] = ptr[pos + i]
+
+        # Check if all are digits: min >= '0' and max <= '9'
+        var min_val = chunk.reduce_min()
+        var max_val = chunk.reduce_max()
+        var all_digits = min_val >= ord('0') and max_val <= ord('9')
+
+        if all_digits:
+            # Convert 8 digits in parallel
+            var digits = (chunk - ord('0')).cast[DType.int64]()
+
+            # Multiply by powers of 10: [10^7, 10^6, ..., 10^0]
+            alias powers = SIMD[DType.int64, 8](
+                10000000, 1000000, 100000, 10000, 1000, 100, 10, 1
+            )
+            result = (digits * powers).reduce_add()
+            pos += 8
+
+    # Scalar path for remaining digits
+    while pos < end:
+        var c = ptr[pos]
+        if c < ord('0') or c > ord('9'):
+            break
+        result = result * 10 + Int64(c - ord('0'))
+        pos += 1
+
+    return -result if negative else result
+
+
 @register_passable("trivial")
 struct TapeEntry:
     """64-bit tape entry: [8-bit type | 56-bit payload]."""
@@ -237,7 +288,10 @@ struct TapeParser:
 
     fn parse(mut self) raises -> JsonTape:
         """Parse JSON into tape representation."""
-        var tape = JsonTape(capacity=len(self.index))
+        # Pre-allocate: estimate ~1.5 tape entries per structural char
+        # (numbers use 2 entries, strings/literals use 1)
+        var estimated_entries = len(self.index) * 3 // 2 + 10
+        var tape = JsonTape(capacity=estimated_entries)
         tape.source = self.source
         tape.append_root()
 
@@ -320,15 +374,17 @@ struct TapeParser:
                 else:
                     break
 
-            var num_str = self.source[start:end]
             if is_float:
+                var num_str = self.source[start:end]
                 tape.append_double(atof(num_str))
             else:
-                tape.append_int64(atol(num_str))
+                # Fast path: parse integer directly
+                tape.append_int64(_fast_parse_int(ptr, start, end))
             self.idx_pos += 1  # Move past next structural char
         else:
             self.idx_pos += 1
 
+    @always_inline
     fn _parse_literal_between(mut self, mut tape: JsonTape, start: Int, end: Int) raises:
         """Parse literal/number value between two source positions."""
         var ptr = self.source.unsafe_ptr()
@@ -368,11 +424,12 @@ struct TapeParser:
                 else:
                     break
 
-            var num_str = self.source[pos:num_end]
             if is_float:
+                var num_str = self.source[pos:num_end]
                 tape.append_double(atof(num_str))
             else:
-                tape.append_int64(atol(num_str))
+                # Fast path: parse integer directly without string allocation
+                tape.append_int64(_fast_parse_int(ptr, pos, num_end))
 
     fn _parse_object(mut self, mut tape: JsonTape) raises:
         """Parse JSON object {...}."""
