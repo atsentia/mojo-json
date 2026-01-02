@@ -1,0 +1,25 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+__pycache__/
+*.pyc
+.mojo_cache/
+
+# Benchmark competitors (cloned separately)
+benchmarks/competitors/
+
+# Benchmark results (regenerated on each run)
+benchmarks/results/*.json
+benchmarks/results/*.csv
+
+# Large test data files (>1MB)
+benchmarks/data/*_10mb.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.mojopkg

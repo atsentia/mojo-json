@@ -50,8 +50,8 @@ significant whitespace or long strings/numbers. Small JSON documents
 may not benefit due to SIMD setup overhead.
 """
 
-from .error import JsonParseError, JsonErrorCode
-from .value import JsonValue, JsonArray, JsonObject, JsonType
+from src.error import JsonParseError, JsonErrorCode
+from src.value import JsonValue, JsonArray, JsonObject, JsonType
 
 
 # =============================================================================
@@ -86,6 +86,29 @@ fn _is_whitespace_scalar(c: UInt8) -> Bool:
 
 
 @always_inline
+fn _utf8_byte_count(lead_byte: UInt8) -> Int:
+    """Return number of bytes in UTF-8 sequence based on lead byte.
+
+    UTF-8 encoding:
+    - 0x00-0x7F: 1 byte (ASCII)
+    - 0xC0-0xDF: 2 bytes
+    - 0xE0-0xEF: 3 bytes
+    - 0xF0-0xF7: 4 bytes
+    - 0x80-0xBF: continuation byte (shouldn't be lead)
+    """
+    if lead_byte < 0x80:
+        return 1  # ASCII
+    elif lead_byte < 0xC0:
+        return 1  # Invalid lead byte, treat as single byte
+    elif lead_byte < 0xE0:
+        return 2  # 2-byte sequence
+    elif lead_byte < 0xF0:
+        return 3  # 3-byte sequence
+    else:
+        return 4  # 4-byte sequence
+
+
+@always_inline
 fn _is_digit_scalar(c: UInt8) -> Bool:
     """Check if a single byte is an ASCII digit.
 
@@ -94,71 +117,70 @@ fn _is_digit_scalar(c: UInt8) -> Bool:
     return c >= DIGIT_0 and c <= DIGIT_9
 
 
+@always_inline
+fn _create_ws_mask(chunk: SIMD[DType.uint8, SIMD_WIDTH]) -> SIMD[DType.uint8, SIMD_WIDTH]:
+    """Create whitespace mask. Returns 1 for whitespace, 0 otherwise."""
+    var mask = SIMD[DType.uint8, SIMD_WIDTH]()
+
+    @parameter
+    for i in range(SIMD_WIDTH):
+        var c = chunk[i]
+        mask[i] = 1 if (c == SPACE or c == TAB or c == NEWLINE or c == CARRIAGE_RETURN) else 0
+
+    return mask
+
+
 fn _skip_whitespace_simd(data: String, start: Int) -> Tuple[Int, Int]:
     """
-    PERF-004: SIMD-accelerated whitespace skipping.
+    SIMD-optimized whitespace skipping for Mojo 0.25.7.
 
-    Processes 16 bytes at a time to find the first non-whitespace character.
-    Returns (new_position, newline_count) - newline count is needed for
-    accurate line tracking.
-
-    Algorithm:
-    1. Load 16 bytes into a SIMD register
-    2. Compare against all whitespace chars simultaneously: (chunk == ' ') | (chunk == '\t') | ...
-    3. If ALL are whitespace, advance by 16 and repeat
-    4. Otherwise, find first non-whitespace using leading_zeros-like logic
-
-    Speedup: ~4-8x for whitespace-heavy JSON (pretty-printed files)
+    Uses reduce_add() for fast all-whitespace detection.
+    Returns (new_position, newline_count).
     """
     var pos = start
     var n = len(data)
     var newline_count = 0
 
     # SIMD processing for 16-byte chunks
-    # Only use SIMD if we have at least one full chunk
     while pos + SIMD_WIDTH <= n:
-        # Load 16 bytes from string
+        # Load 16 bytes
         var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
 
         @parameter
         for i in range(SIMD_WIDTH):
             chunk[i] = ord(data[pos + i])
 
-        # Check which bytes are whitespace (parallel comparison)
-        var is_space = chunk == SPACE
-        var is_tab = chunk == TAB
-        var is_newline = chunk == NEWLINE
-        var is_cr = chunk == CARRIAGE_RETURN
-        var is_ws = is_space | is_tab | is_newline | is_cr
+        # Create whitespace mask
+        var ws_mask = _create_ws_mask(chunk)
 
-        # Check if ALL bytes are whitespace
-        if is_ws.reduce_and():
-            # Count newlines in this chunk for line tracking
+        # Quick check: are ALL bytes whitespace?
+        if ws_mask.reduce_add() == SIMD_WIDTH:
+            # Count newlines in this chunk
             @parameter
             for i in range(SIMD_WIDTH):
-                if is_newline[i]:
+                if chunk[i] == NEWLINE:
                     newline_count += 1
             pos += SIMD_WIDTH
-        else:
-            # Found non-whitespace, find its position
-            @parameter
-            for i in range(SIMD_WIDTH):
-                if not is_ws[i]:
-                    # Count newlines up to this position
-                    for j in range(i):
-                        if chunk[j] == NEWLINE:
-                            newline_count += 1
-                    return (pos + i, newline_count)
-            # Should not reach here if reduce_and was false
-            break
+            continue
 
-    # Scalar tail processing for remaining < 16 bytes
+        # Find first non-whitespace and count newlines up to it
+        @parameter
+        for i in range(SIMD_WIDTH):
+            if ws_mask[i] == 0:
+                return (pos + i, newline_count)
+            if chunk[i] == NEWLINE:
+                newline_count += 1
+
+        # Should not reach here
+        break
+
+    # Scalar tail
     while pos < n:
-        var c = ord(data[pos])
-        if c == NEWLINE:
+        var c = Int(ord(data[pos]))
+        if c == Int(NEWLINE):
             newline_count += 1
             pos += 1
-        elif c == SPACE or c == TAB or c == CARRIAGE_RETURN:
+        elif c == Int(SPACE) or c == Int(TAB) or c == Int(CARRIAGE_RETURN):
             pos += 1
         else:
             break
@@ -166,29 +188,31 @@ fn _skip_whitespace_simd(data: String, start: Int) -> Tuple[Int, Int]:
     return (pos, newline_count)
 
 
+@always_inline
+fn _create_string_special_mask(chunk: SIMD[DType.uint8, SIMD_WIDTH]) -> SIMD[DType.uint8, SIMD_WIDTH]:
+    """Create mask for string special chars (quote, backslash, control chars)."""
+    var mask = SIMD[DType.uint8, SIMD_WIDTH]()
+
+    @parameter
+    for i in range(SIMD_WIDTH):
+        var c = chunk[i]
+        mask[i] = 1 if (c == QUOTE or c == BACKSLASH or c < 0x20) else 0
+
+    return mask
+
+
 fn _find_string_end_simd(data: String, start: Int) -> Tuple[Int, Bool]:
     """
-    PERF-004: SIMD-accelerated string boundary detection.
+    SIMD-optimized string boundary detection for Mojo 0.25.7.
 
-    Scans for closing quote (") or escape character (\\) in parallel.
-    Returns (position, found_escape) where:
-    - position: index of quote or backslash
-    - found_escape: True if backslash found, False if quote found
-
-    This is used to quickly find how much of a string can be copied directly
-    without character-by-character processing.
-
-    Algorithm:
-    1. Load 16 bytes
-    2. Check for quote OR backslash: (chunk == '"') | (chunk == '\\')
-    3. If none found, we can bulk-copy 16 chars
-    4. If found, return position of first match
-
-    Speedup: ~3-6x for long strings without escapes
+    Scans for closing quote (") or escape character (\\).
+    Uses reduce_add() for fast no-special-chars detection.
+    Returns (position, found_escape).
     """
     var pos = start
     var n = len(data)
 
+    # SIMD processing for 16-byte chunks
     while pos + SIMD_WIDTH <= n:
         # Load 16 bytes
         var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
@@ -197,25 +221,20 @@ fn _find_string_end_simd(data: String, start: Int) -> Tuple[Int, Bool]:
         for i in range(SIMD_WIDTH):
             chunk[i] = ord(data[pos + i])
 
-        # Check for string terminators or escape
-        var is_quote = chunk == QUOTE
-        var is_escape = chunk == BACKSLASH
+        # Create special character mask
+        var special_mask = _create_string_special_mask(chunk)
 
-        # Also check for control characters (< 0x20) which are invalid in JSON strings
-        var is_control = chunk < 0x20
-
-        var is_special = is_quote | is_escape | is_control
-
-        # If no special characters, continue to next chunk
-        if not is_special.reduce_or():
+        # Quick check: no special characters in this chunk?
+        if special_mask.reduce_add() == 0:
             pos += SIMD_WIDTH
             continue
 
-        # Found special character, find first occurrence
+        # Find first special character
         @parameter
         for i in range(SIMD_WIDTH):
-            if is_special[i]:
-                if is_quote[i]:
+            if special_mask[i] == 1:
+                var c = chunk[i]
+                if c == QUOTE:
                     return (pos + i, False)  # Found closing quote
                 else:
                     return (pos + i, True)   # Found escape or control char
@@ -223,12 +242,12 @@ fn _find_string_end_simd(data: String, start: Int) -> Tuple[Int, Bool]:
         # Should not reach here
         break
 
-    # Scalar tail - check remaining bytes
+    # Scalar tail
     while pos < n:
-        var c = ord(data[pos])
-        if c == QUOTE:
+        var c = Int(ord(data[pos]))
+        if c == Int(QUOTE):
             return (pos, False)
-        if c == BACKSLASH or c < 0x20:
+        if c == Int(BACKSLASH) or c < 0x20:
             return (pos, True)
         pos += 1
 
@@ -236,25 +255,31 @@ fn _find_string_end_simd(data: String, start: Int) -> Tuple[Int, Bool]:
     return (n, True)
 
 
+@always_inline
+fn _create_digit_mask(chunk: SIMD[DType.uint8, SIMD_WIDTH]) -> SIMD[DType.uint8, SIMD_WIDTH]:
+    """Create mask for digit characters. Returns 1 for digits, 0 otherwise."""
+    var mask = SIMD[DType.uint8, SIMD_WIDTH]()
+
+    @parameter
+    for i in range(SIMD_WIDTH):
+        var c = chunk[i]
+        mask[i] = 1 if (c >= DIGIT_0 and c <= DIGIT_9) else 0
+
+    return mask
+
+
 fn _count_digits_simd(data: String, start: Int) -> Int:
     """
-    PERF-004: SIMD-accelerated digit counting.
+    SIMD-optimized digit counting for Mojo 0.25.7.
 
-    Counts consecutive ASCII digit characters (0-9) starting from position.
-    Used for fast number parsing - we can process the digit run in bulk.
-
-    Algorithm:
-    1. Load 16 bytes
-    2. Check range: (chunk >= '0') & (chunk <= '9')
-    3. If ALL are digits, count += 16
-    4. Otherwise, count leading digits
-
-    Speedup: ~2-4x for numbers with many digits (e.g., high-precision floats)
+    Uses reduce_add() for fast all-digits detection.
+    Counts consecutive ASCII digit characters (0-9).
     """
     var pos = start
     var n = len(data)
     var count = 0
 
+    # SIMD processing for 16-byte chunks
     while pos + SIMD_WIDTH <= n:
         # Load 16 bytes
         var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
@@ -263,28 +288,29 @@ fn _count_digits_simd(data: String, start: Int) -> Int:
         for i in range(SIMD_WIDTH):
             chunk[i] = ord(data[pos + i])
 
-        # Check if each byte is a digit
-        var is_digit = (chunk >= DIGIT_0) & (chunk <= DIGIT_9)
+        # Create digit mask
+        var digit_mask = _create_digit_mask(chunk)
+        var digit_count = digit_mask.reduce_add()
 
-        # If all are digits, continue
-        if is_digit.reduce_and():
+        # Quick check: are ALL bytes digits?
+        if digit_count == SIMD_WIDTH:
             count += SIMD_WIDTH
             pos += SIMD_WIDTH
-        else:
-            # Count leading digits in this chunk
-            @parameter
-            for i in range(SIMD_WIDTH):
-                if is_digit[i]:
-                    count += 1
-                else:
-                    return count
-            # Should not reach here
-            break
+            continue
+
+        # Find first non-digit (count leading digits)
+        @parameter
+        for i in range(SIMD_WIDTH):
+            if digit_mask[i] == 0:
+                return count + i
+
+        # Should not reach here
+        break
 
     # Scalar tail
     while pos < n:
-        var c = ord(data[pos])
-        if c >= DIGIT_0 and c <= DIGIT_9:
+        var c = Int(ord(data[pos]))
+        if c >= Int(DIGIT_0) and c <= Int(DIGIT_9):
             count += 1
             pos += 1
         else:
@@ -298,8 +324,7 @@ fn _count_digits_simd(data: String, start: Int) -> Int:
 # =============================================================================
 
 
-@value
-struct ParserConfig:
+struct ParserConfig(Copyable, Movable):
     """Configuration for the JSON parser."""
 
     var max_depth: Int
@@ -327,6 +352,22 @@ struct ParserConfig:
         self.max_depth = max_depth
         self.allow_trailing_comma = allow_trailing_comma
         self.allow_comments = allow_comments
+
+    fn __copyinit__(out self, other: Self):
+        """Copy constructor."""
+        self.max_depth = other.max_depth
+        self.allow_trailing_comma = other.allow_trailing_comma
+        self.allow_comments = other.allow_comments
+
+    fn __moveinit__(out self, deinit other: Self):
+        """Move constructor."""
+        self.max_depth = other.max_depth
+        self.allow_trailing_comma = other.allow_trailing_comma
+        self.allow_comments = other.allow_comments
+
+    fn copy(self) -> Self:
+        """Create a copy of this config."""
+        return Self(self.max_depth, self.allow_trailing_comma, self.allow_comments)
 
 
 struct JsonParser:
@@ -362,7 +403,7 @@ struct JsonParser:
         self.line = 1
         self.column = 1
         self.depth = 0
-        self.config = ParserConfig()
+        self.config = ParserConfig(max_depth=1000)
 
     fn __init__(out self, source: String, config: ParserConfig):
         """Create parser with custom configuration."""
@@ -371,13 +412,13 @@ struct JsonParser:
         self.line = 1
         self.column = 1
         self.depth = 0
-        self.config = config
+        self.config = config.copy()
 
     # ============================================================
     # Public interface
     # ============================================================
 
-    fn parse(inout self) raises -> JsonValue:
+    fn parse(mut self) raises -> JsonValue:
         """
         Parse the JSON source string.
 
@@ -399,14 +440,14 @@ struct JsonParser:
         if self.pos < len(self.source):
             raise Error(self._error("Unexpected content after JSON value").format())
 
-        return value
+        return value^
 
-    fn parse_safe(inout self) -> Tuple[JsonValue, JsonParseError, Bool]:
+    fn parse_safe(mut self) -> Tuple[JsonValue, JsonParseError, Bool]:
         """
         Parse JSON without raising exceptions.
 
         Returns:
-            Tuple of (value, error, is_ok)
+            Tuple of (value, error, is_ok).
             If is_ok is True, value is valid; otherwise error contains details.
         """
         self._skip_whitespace()
@@ -429,11 +470,11 @@ struct JsonParser:
                     False,
                 )
 
-            return (value, JsonParseError(""), True)
+            return (value^, JsonParseError(""), True)
         except e:
             return (
                 JsonValue.null(),
-                self._error(str(e)),
+                self._error(String(e)),
                 False,
             )
 
@@ -441,7 +482,7 @@ struct JsonParser:
     # Value parsing
     # ============================================================
 
-    fn _parse_value(inout self) raises -> JsonValue:
+    fn _parse_value(mut self) raises -> JsonValue:
         """Parse any JSON value."""
         self._skip_whitespace()
 
@@ -465,13 +506,13 @@ struct JsonParser:
         else:
             raise Error(self._error("Unexpected character: " + c).format())
 
-    fn _parse_null(inout self) raises -> JsonValue:
+    fn _parse_null(mut self) raises -> JsonValue:
         """Parse 'null' literal."""
         if not self._consume_literal("null"):
             raise Error(self._error("Expected 'null'").format())
         return JsonValue.null()
 
-    fn _parse_bool(inout self) raises -> JsonValue:
+    fn _parse_bool(mut self) raises -> JsonValue:
         """Parse 'true' or 'false' literal."""
         if self.source[self.pos] == 't':
             if not self._consume_literal("true"):
@@ -482,7 +523,7 @@ struct JsonParser:
                 raise Error(self._error("Expected 'false'").format())
             return JsonValue.from_bool(False)
 
-    fn _parse_number(inout self) raises -> JsonValue:
+    fn _parse_number(mut self) raises -> JsonValue:
         """Parse a JSON number (integer or float).
 
         PERF-004: Uses SIMD to count consecutive digits, allowing bulk advancement
@@ -604,18 +645,18 @@ struct JsonParser:
             except:
                 raise Error(self._error("Invalid number: " + num_str).format())
 
-    fn _parse_string(inout self) raises -> JsonValue:
+    fn _parse_string(mut self) raises -> JsonValue:
         """Parse a JSON string."""
         var s = self._parse_string_content()
         return JsonValue.from_string(s)
 
-    fn _parse_string_content(inout self) raises -> String:
+    fn _parse_string_content(mut self) raises -> String:
         """Parse string content (used for both values and object keys).
 
         PERF-004: Uses SIMD to quickly find string boundaries and bulk-copy
         regular characters. Falls back to scalar for escape sequence handling.
         """
-        if self.pos >= len(self.source) or self.source[self.pos] != '"':
+        if self.pos >= len(self.source) or ord(self.source[self.pos]) != ord('"'):
             raise Error(self._error("Expected '\"'").format())
 
         self._advance()  # Skip opening quote
@@ -630,12 +671,10 @@ struct JsonParser:
                 var end_pos = scan_result[0]
                 var found_escape = scan_result[1]
 
-                # Bulk-copy characters from pos to end_pos
+                # Bulk-copy characters from pos to end_pos using slice
                 if end_pos > self.pos:
-                    # Copy substring (all regular characters)
-                    for i in range(self.pos, end_pos):
-                        result += self.source[i]
-                        self.column += 1
+                    result += self.source[self.pos:end_pos]
+                    self.column += end_pos - self.pos
                     self.pos = end_pos
 
                 # If we found a quote, we're done
@@ -647,13 +686,16 @@ struct JsonParser:
             if self.pos >= len(self.source):
                 break
 
-            var c = self.source[self.pos]
+            # UNICODE FIX: Use unsafe_ptr() for correct byte access
+            # Mojo's string[i] / ord() has bugs with multi-byte UTF-8
+            var byte_ptr = self.source.unsafe_ptr()
+            var byte = byte_ptr[self.pos]
 
-            if c == '"':
+            if byte == QUOTE:  # '"' = 0x22
                 self._advance()  # Skip closing quote
                 return result
 
-            if c == '\\':
+            if byte == BACKSLASH:  # '\\' = 0x5C
                 # Escape sequence
                 self._advance()
                 if self.pos >= len(self.source):
@@ -686,18 +728,30 @@ struct JsonParser:
                     raise Error(
                         self._error("Invalid escape sequence: \\" + escape_char).format()
                     )
-            elif ord(c) < 32:
-                # Control characters must be escaped
+            elif byte < 0x20:
+                # Control characters (0x00-0x1F) must be escaped
                 raise Error(
                     self._error("Unescaped control character in string").format()
                 )
+            elif byte >= 0x80:
+                # UNICODE FIX: Multi-byte UTF-8 sequence
+                # Copy entire sequence using string slice to preserve encoding
+                var byte_count = _utf8_byte_count(byte)
+                if self.pos + byte_count <= len(self.source):
+                    result += self.source[self.pos : self.pos + byte_count]
+                    self.column += byte_count
+                    self.pos += byte_count
+                else:
+                    # Incomplete UTF-8 sequence at end of string
+                    raise Error(self._error("Incomplete UTF-8 sequence in string").format())
             else:
-                result += c
+                # Regular ASCII character
+                result += self.source[self.pos]
                 self._advance()
 
         raise Error(self._error("Unterminated string").format())
 
-    fn _parse_unicode_escape(inout self) raises -> Int:
+    fn _parse_unicode_escape(mut self) raises -> Int:
         """Parse \\uXXXX unicode escape sequence."""
         if self.pos + 4 > len(self.source):
             raise Error(self._error("Incomplete unicode escape").format())
@@ -743,7 +797,7 @@ struct JsonParser:
 
         return code
 
-    fn _parse_unicode_escape_digits(inout self) raises -> Int:
+    fn _parse_unicode_escape_digits(mut self) raises -> Int:
         """Parse the 4 hex digits of a unicode escape."""
         if self.pos + 4 > len(self.source):
             raise Error(self._error("Incomplete unicode escape").format())
@@ -790,9 +844,9 @@ struct JsonParser:
             var b4 = 0x80 | (code & 0x3F)
             return chr(b1) + chr(b2) + chr(b3) + chr(b4)
 
-    fn _parse_array(inout self) raises -> JsonValue:
+    fn _parse_array(mut self) raises -> JsonValue:
         """Parse a JSON array."""
-        if self.source[self.pos] != '[':
+        if ord(self.source[self.pos]) != ord('['):
             raise Error(self._error("Expected '['").format())
 
         self._advance()  # Skip '['
@@ -809,13 +863,14 @@ struct JsonParser:
         if self.pos < len(self.source) and self.source[self.pos] == ']':
             self._advance()
             self.depth -= 1
-            return JsonValue.from_array(arr)
+            # PERF: Use move to avoid copying the list
+            return JsonValue.from_array_move(arr^)
 
         # Parse elements
         while True:
             self._skip_whitespace()
             var value = self._parse_value()
-            arr.append(value)
+            arr.append(value^)
 
             self._skip_whitespace()
 
@@ -826,7 +881,8 @@ struct JsonParser:
             if c == ']':
                 self._advance()
                 self.depth -= 1
-                return JsonValue.from_array(arr)
+                # PERF: Use move to avoid copying the list
+                return JsonValue.from_array_move(arr^)
             elif c == ',':
                 self._advance()
                 self._skip_whitespace()
@@ -836,15 +892,16 @@ struct JsonParser:
                     if self.config.allow_trailing_comma:
                         self._advance()
                         self.depth -= 1
-                        return JsonValue.from_array(arr)
+                        # PERF: Use move to avoid copying the list
+                        return JsonValue.from_array_move(arr^)
                     else:
                         raise Error(self._error("Trailing comma not allowed").format())
             else:
                 raise Error(self._error("Expected ',' or ']' in array").format())
 
-    fn _parse_object(inout self) raises -> JsonValue:
+    fn _parse_object(mut self) raises -> JsonValue:
         """Parse a JSON object."""
-        if self.source[self.pos] != '{':
+        if ord(self.source[self.pos]) != ord('{'):
             raise Error(self._error("Expected '{'").format())
 
         self._advance()  # Skip '{'
@@ -861,14 +918,15 @@ struct JsonParser:
         if self.pos < len(self.source) and self.source[self.pos] == '}':
             self._advance()
             self.depth -= 1
-            return JsonValue.from_object(obj)
+            # PERF: Use move to avoid copying the dict
+            return JsonValue.from_object_move(obj^)
 
         # Parse key-value pairs
         while True:
             self._skip_whitespace()
 
             # Parse key (must be string)
-            if self.pos >= len(self.source) or self.source[self.pos] != '"':
+            if self.pos >= len(self.source) or ord(self.source[self.pos]) != ord('"'):
                 raise Error(self._error("Expected string key in object").format())
 
             var key = self._parse_string_content()
@@ -876,7 +934,7 @@ struct JsonParser:
             self._skip_whitespace()
 
             # Expect colon
-            if self.pos >= len(self.source) or self.source[self.pos] != ':':
+            if self.pos >= len(self.source) or ord(self.source[self.pos]) != ord(':'):
                 raise Error(self._error("Expected ':' after object key").format())
 
             self._advance()  # Skip ':'
@@ -884,7 +942,7 @@ struct JsonParser:
 
             # Parse value
             var value = self._parse_value()
-            obj[key] = value
+            obj[key] = value^
 
             self._skip_whitespace()
 
@@ -895,7 +953,8 @@ struct JsonParser:
             if c == '}':
                 self._advance()
                 self.depth -= 1
-                return JsonValue.from_object(obj)
+                # PERF: Use move to avoid copying the dict
+                return JsonValue.from_object_move(obj^)
             elif c == ',':
                 self._advance()
                 self._skip_whitespace()
@@ -905,7 +964,8 @@ struct JsonParser:
                     if self.config.allow_trailing_comma:
                         self._advance()
                         self.depth -= 1
-                        return JsonValue.from_object(obj)
+                        # PERF: Use move to avoid copying the dict
+                        return JsonValue.from_object_move(obj^)
                     else:
                         raise Error(self._error("Trailing comma not allowed").format())
             else:
@@ -915,7 +975,7 @@ struct JsonParser:
     # Helper methods
     # ============================================================
 
-    fn _advance(inout self):
+    fn _advance(mut self):
         """Advance position by one character, updating line/column."""
         if self.pos < len(self.source):
             if self.source[self.pos] == '\n':
@@ -925,7 +985,7 @@ struct JsonParser:
                 self.column += 1
             self.pos += 1
 
-    fn _skip_whitespace(inout self):
+    fn _skip_whitespace(mut self):
         """Skip whitespace characters and optionally comments.
 
         PERF-004: Uses SIMD acceleration when comments are disabled and
@@ -982,32 +1042,32 @@ struct JsonParser:
             else:
                 break
 
-    fn _skip_line_comment(inout self):
+    fn _skip_line_comment(mut self):
         """Skip // line comment."""
-        while self.pos < len(self.source) and self.source[self.pos] != '\n':
+        while self.pos < len(self.source) and ord(self.source[self.pos]) != ord('\n'):
             self._advance()
         if self.pos < len(self.source):
             self._advance()  # Skip newline
 
-    fn _skip_block_comment(inout self):
+    fn _skip_block_comment(mut self):
         """Skip /* block comment */."""
         self._advance()  # Skip '/'
         self._advance()  # Skip '*'
 
         while self.pos + 1 < len(self.source):
-            if self.source[self.pos] == '*' and self.source[self.pos + 1] == '/':
+            if ord(self.source[self.pos]) == ord('*') and ord(self.source[self.pos + 1]) == ord('/'):
                 self._advance()  # Skip '*'
                 self._advance()  # Skip '/'
                 return
             self._advance()
 
-    fn _consume_literal(inout self, literal: String) -> Bool:
+    fn _consume_literal(mut self, literal: String) -> Bool:
         """Try to consume an exact literal string."""
         if self.pos + len(literal) > len(self.source):
             return False
 
         for i in range(len(literal)):
-            if self.source[self.pos + i] != literal[i]:
+            if ord(self.source[self.pos + i]) != ord(literal[i]):
                 return False
 
         for _ in range(len(literal)):

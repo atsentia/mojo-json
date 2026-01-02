@@ -15,16 +15,15 @@ Example:
 """
 
 
-@value
-struct JsonParseError(Stringable):
+struct JsonParseError(Copyable, Movable, Stringable):
     """
     Represents a JSON parsing error with position information.
 
     Attributes:
-        message: Description of the error
-        position: Byte offset in the source string
-        line: Line number (1-indexed)
-        column: Column number (1-indexed)
+        message: Description of the error.
+        position: Byte offset in the source string.
+        line: Line number (1-indexed).
+        column: Column number (1-indexed).
     """
 
     var message: String
@@ -59,6 +58,24 @@ struct JsonParseError(Stringable):
         self.line = line
         self.column = column
 
+    fn __copyinit__(out self, other: Self):
+        """Copy constructor."""
+        self.message = other.message
+        self.position = other.position
+        self.line = other.line
+        self.column = other.column
+
+    fn __moveinit__(out self, deinit other: Self):
+        """Move constructor."""
+        self.message = other.message^
+        self.position = other.position
+        self.line = other.line
+        self.column = other.column
+
+    fn copy(self) -> Self:
+        """Create a copy of this error."""
+        return Self(self.message, self.position, self.line, self.column)
+
     fn __str__(self) -> String:
         """Format error as a human-readable string."""
         return self.format()
@@ -67,9 +84,9 @@ struct JsonParseError(Stringable):
         """Format error as a human-readable string."""
         return (
             "JSON parse error at line "
-            + str(self.line)
+            + String(self.line)
             + ", column "
-            + str(self.column)
+            + String(self.column)
             + ": "
             + self.message
         )
@@ -127,8 +144,7 @@ struct JsonErrorCode:
     alias NESTING_TOO_DEEP: Int = 14
 
 
-@value
-struct ParseResult[T: CollectionElement]:
+struct ParseResult[T: Copyable & Movable](Copyable, Movable):
     """
     Result type for parsing operations.
 
@@ -142,9 +158,27 @@ struct ParseResult[T: CollectionElement]:
 
     fn __init__(out self, value: T):
         """Create successful result with value."""
-        self._value = value
+        self._value = value.copy()
         self._error = JsonParseError("")
         self._is_ok = True
+
+    fn __init__(out self, error: JsonParseError, value: T):
+        """Create error result with a placeholder value."""
+        self._value = value.copy()
+        self._error = error.copy()
+        self._is_ok = False
+
+    fn __copyinit__(out self, other: Self):
+        """Copy constructor."""
+        self._value = other._value.copy()
+        self._error = other._error.copy()
+        self._is_ok = other._is_ok
+
+    fn __moveinit__(out self, deinit other: Self):
+        """Move constructor."""
+        self._value = other._value^
+        self._error = other._error^
+        self._is_ok = other._is_ok
 
     @staticmethod
     fn ok(value: T) -> Self:
@@ -152,12 +186,9 @@ struct ParseResult[T: CollectionElement]:
         return Self(value)
 
     @staticmethod
-    fn err(error: JsonParseError) -> Self:
+    fn err(error: JsonParseError, default_value: T) -> Self:
         """Create error result."""
-        var result = Self.__init__()
-        result._error = error
-        result._is_ok = False
-        return result
+        return Self(error, default_value)
 
     fn is_ok(self) -> Bool:
         """Check if result is successful."""
@@ -173,7 +204,7 @@ struct ParseResult[T: CollectionElement]:
 
         Precondition: is_ok() must be True.
         """
-        return self._value
+        return self._value.copy()
 
     fn error(self) -> JsonParseError:
         """
@@ -181,4 +212,4 @@ struct ParseResult[T: CollectionElement]:
 
         Precondition: is_err() must be True.
         """
-        return self._error
+        return self._error.copy()

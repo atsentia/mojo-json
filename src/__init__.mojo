@@ -59,13 +59,13 @@ Type Aliases:
 """
 
 # Error types
-from .error import JsonParseError, JsonErrorCode
+from src.error import JsonParseError, JsonErrorCode
 
 # Value types
-from .value import JsonValue, JsonArray, JsonObject, JsonType
+from src.value import JsonValue, JsonArray, JsonObject, JsonType
 
 # Parser
-from .parser import (
+from src.parser import (
     JsonParser,
     ParserConfig,
     parse,
@@ -74,7 +74,7 @@ from .parser import (
 )
 
 # Serializer
-from .serializer import (
+from src.serializer import (
     JsonSerializer,
     SerializerConfig,
     serialize,

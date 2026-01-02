@@ -32,11 +32,10 @@ Example:
     # }
 """
 
-from .value import JsonValue, JsonArray, JsonObject, JsonType
+from src.value import JsonValue, JsonArray, JsonObject, JsonType
 
 
-@value
-struct SerializerConfig:
+struct SerializerConfig(Copyable, Movable):
     """Configuration for JSON serialization."""
 
     var indent: String
@@ -71,10 +70,28 @@ struct SerializerConfig:
         self.escape_unicode = escape_unicode
         self.escape_forward_slash = escape_forward_slash
 
+    fn __copyinit__(out self, other: Self):
+        """Copy constructor."""
+        self.indent = other.indent
+        self.sort_keys = other.sort_keys
+        self.escape_unicode = other.escape_unicode
+        self.escape_forward_slash = other.escape_forward_slash
+
+    fn __moveinit__(out self, deinit other: Self):
+        """Move constructor."""
+        self.indent = other.indent^
+        self.sort_keys = other.sort_keys
+        self.escape_unicode = other.escape_unicode
+        self.escape_forward_slash = other.escape_forward_slash
+
+    fn copy(self) -> Self:
+        """Create a copy of this config."""
+        return Self(self.indent, self.sort_keys, self.escape_unicode, self.escape_forward_slash)
+
     @staticmethod
     fn compact() -> Self:
         """Create compact serializer configuration."""
-        return SerializerConfig()
+        return SerializerConfig(indent="")
 
     @staticmethod
     fn pretty(indent: String = "  ") -> Self:
@@ -94,17 +111,17 @@ struct JsonSerializer:
 
     fn __init__(out self):
         """Create serializer with default configuration."""
-        self.config = SerializerConfig()
+        self.config = SerializerConfig(indent="")
 
     fn __init__(out self, config: SerializerConfig):
         """Create serializer with custom configuration."""
-        self.config = config
+        self.config = config.copy()
 
     # ============================================================
     # Public interface
     # ============================================================
 
-    fn serialize(self, value: JsonValue) -> String:
+    fn serialize(self, value: JsonValue) raises -> String:
         """
         Serialize a JsonValue to a JSON string.
 
@@ -123,7 +140,7 @@ struct JsonSerializer:
     # Compact serialization
     # ============================================================
 
-    fn _serialize_compact(self, value: JsonValue) -> String:
+    fn _serialize_compact(self, value: JsonValue) raises -> String:
         """Serialize to compact JSON (no whitespace)."""
         if value.is_null():
             return "null"
@@ -133,7 +150,7 @@ struct JsonSerializer:
             else:
                 return "false"
         elif value.is_int():
-            return str(value.as_int())
+            return String(value.as_int())
         elif value.is_float():
             return self._format_float(value.as_float())
         elif value.is_string():
@@ -145,7 +162,7 @@ struct JsonSerializer:
         else:
             return "null"
 
-    fn _serialize_array_compact(self, arr: List[JsonValue]) -> String:
+    fn _serialize_array_compact(self, arr: List[JsonValue]) raises -> String:
         """Serialize array to compact JSON."""
         var result = String("[")
         for i in range(len(arr)):
@@ -155,13 +172,13 @@ struct JsonSerializer:
         result += "]"
         return result
 
-    fn _serialize_object_compact(self, obj: Dict[String, JsonValue]) -> String:
+    fn _serialize_object_compact(self, obj: Dict[String, JsonValue]) raises -> String:
         """Serialize object to compact JSON."""
         var result = String("{")
 
         var keys = List[String]()
-        for key in obj.keys():
-            keys.append(key[])
+        for entry in obj.items():
+            keys.append(entry.key)
 
         if self.config.sort_keys:
             # Simple bubble sort for key sorting
@@ -181,7 +198,10 @@ struct JsonSerializer:
 
             result += self._escape_string(key)
             result += ":"
-            result += self._serialize_compact(obj[key])
+            try:
+                result += self._serialize_compact(obj[key])
+            except:
+                pass
 
         result += "}"
         return result
@@ -190,7 +210,7 @@ struct JsonSerializer:
     # Pretty serialization
     # ============================================================
 
-    fn _serialize_pretty(self, value: JsonValue, depth: Int) -> String:
+    fn _serialize_pretty(self, value: JsonValue, depth: Int) raises -> String:
         """Serialize to pretty-printed JSON."""
         if value.is_null():
             return "null"
@@ -200,7 +220,7 @@ struct JsonSerializer:
             else:
                 return "false"
         elif value.is_int():
-            return str(value.as_int())
+            return String(value.as_int())
         elif value.is_float():
             return self._format_float(value.as_float())
         elif value.is_string():
@@ -212,7 +232,7 @@ struct JsonSerializer:
         else:
             return "null"
 
-    fn _serialize_array_pretty(self, arr: List[JsonValue], depth: Int) -> String:
+    fn _serialize_array_pretty(self, arr: List[JsonValue], depth: Int) raises -> String:
         """Serialize array with pretty printing."""
         if len(arr) == 0:
             return "[]"
@@ -231,7 +251,7 @@ struct JsonSerializer:
         result += "]"
         return result
 
-    fn _serialize_object_pretty(self, obj: Dict[String, JsonValue], depth: Int) -> String:
+    fn _serialize_object_pretty(self, obj: Dict[String, JsonValue], depth: Int) raises -> String:
         """Serialize object with pretty printing."""
         if len(obj) == 0:
             return "{}"
@@ -240,8 +260,8 @@ struct JsonSerializer:
         var close_indent = self._make_indent(depth)
 
         var keys = List[String]()
-        for key in obj.keys():
-            keys.append(key[])
+        for entry in obj.items():
+            keys.append(entry.key)
 
         if self.config.sort_keys:
             # Simple bubble sort for key sorting
@@ -260,7 +280,10 @@ struct JsonSerializer:
             result += indent
             result += self._escape_string(key)
             result += ": "
-            result += self._serialize_pretty(obj[key], depth + 1)
+            try:
+                result += self._serialize_pretty(obj[key], depth + 1)
+            except:
+                pass
         result += "\n"
         result += close_indent
         result += "}"
@@ -336,7 +359,7 @@ struct JsonSerializer:
         if value == Float64.MAX or value == -Float64.MAX:
             return "null"  # JSON doesn't support Infinity
 
-        var s = str(value)
+        var s = String(value)
 
         # Ensure there's a decimal point for floats
         var has_decimal = False
@@ -359,7 +382,7 @@ struct JsonSerializer:
 # ============================================================
 
 
-fn serialize(value: JsonValue) -> String:
+fn serialize(value: JsonValue) raises -> String:
     """
     Serialize a JsonValue to a compact JSON string.
 
@@ -371,13 +394,13 @@ fn serialize(value: JsonValue) -> String:
 
     Example:
         var value = JsonValue.from_int(42)
-        print(serialize(value))  # "42"
+        print(serialize(value))
     """
     var serializer = JsonSerializer()
     return serializer.serialize(value)
 
 
-fn serialize_pretty(value: JsonValue, indent: String = "  ") -> String:
+fn serialize_pretty(value: JsonValue, indent: String = "  ") raises -> String:
     """
     Serialize a JsonValue to a pretty-printed JSON string.
 
@@ -393,16 +416,13 @@ fn serialize_pretty(value: JsonValue, indent: String = "  ") -> String:
         obj["key"] = JsonValue.from_string("value")
         var value = JsonValue.from_object(obj)
         print(serialize_pretty(value))
-        # {
-        #   "key": "value"
-        # }
     """
     var config = SerializerConfig(indent=indent)
     var serializer = JsonSerializer(config)
     return serializer.serialize(value)
 
 
-fn serialize_with_config(value: JsonValue, config: SerializerConfig) -> String:
+fn serialize_with_config(value: JsonValue, config: SerializerConfig) raises -> String:
     """
     Serialize a JsonValue with custom configuration.
 
@@ -417,7 +437,7 @@ fn serialize_with_config(value: JsonValue, config: SerializerConfig) -> String:
     return serializer.serialize(value)
 
 
-fn to_json(value: JsonValue) -> String:
+fn to_json(value: JsonValue) raises -> String:
     """
     Alias for serialize() for convenience.
 

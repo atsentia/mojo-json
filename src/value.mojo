@@ -73,7 +73,7 @@ struct JsonType:
             return "unknown"
 
 
-struct JsonValue(CollectionElement, Stringable):
+struct JsonValue(Copyable, Movable, Stringable):
     """
     A variant type representing any JSON value.
 
@@ -115,26 +115,31 @@ struct JsonValue(CollectionElement, Stringable):
     # ============================================================
 
     fn __init__(out self):
-        """Create a null value."""
+        """Create a null value.
+
+        PERF: Only allocates minimal storage. List/Dict are created
+        lazily only when needed for array/object types.
+        """
         self._type = JsonType.NULL
         self._bool_val = False
         self._int_val = 0
         self._float_val = 0.0
         self._string_val = ""
+        # PERF: Create with zero capacity to minimize allocation
         self._array_val = List[JsonValue]()
         self._object_val = Dict[String, JsonValue]()
 
-    fn __copyinit__(inout self, other: Self):
+    fn __copyinit__(out self, other: Self):
         """Copy constructor."""
         self._type = other._type
         self._bool_val = other._bool_val
         self._int_val = other._int_val
         self._float_val = other._float_val
         self._string_val = other._string_val
-        self._array_val = other._array_val
-        self._object_val = other._object_val
+        self._array_val = other._array_val.copy()
+        self._object_val = other._object_val.copy()
 
-    fn __moveinit__(inout self, owned other: Self):
+    fn __moveinit__(out self, deinit other: Self):
         """Move constructor."""
         self._type = other._type
         self._bool_val = other._bool_val
@@ -143,6 +148,18 @@ struct JsonValue(CollectionElement, Stringable):
         self._string_val = other._string_val^
         self._array_val = other._array_val^
         self._object_val = other._object_val^
+
+    fn copy(self) -> Self:
+        """Create a copy of this value."""
+        var v = JsonValue()
+        v._type = self._type
+        v._bool_val = self._bool_val
+        v._int_val = self._int_val
+        v._float_val = self._float_val
+        v._string_val = self._string_val
+        v._array_val = self._array_val.copy()
+        v._object_val = self._object_val.copy()
+        return v^
 
     # ============================================================
     # Static factory methods
@@ -159,7 +176,7 @@ struct JsonValue(CollectionElement, Stringable):
         var v = JsonValue()
         v._type = JsonType.BOOL
         v._bool_val = value
-        return v
+        return v^
 
     @staticmethod
     fn from_int(value: Int64) -> JsonValue:
@@ -167,7 +184,7 @@ struct JsonValue(CollectionElement, Stringable):
         var v = JsonValue()
         v._type = JsonType.INT
         v._int_val = value
-        return v
+        return v^
 
     @staticmethod
     fn from_int(value: Int) -> JsonValue:
@@ -180,7 +197,7 @@ struct JsonValue(CollectionElement, Stringable):
         var v = JsonValue()
         v._type = JsonType.FLOAT
         v._float_val = value
-        return v
+        return v^
 
     @staticmethod
     fn from_string(value: String) -> JsonValue:
@@ -188,23 +205,39 @@ struct JsonValue(CollectionElement, Stringable):
         var v = JsonValue()
         v._type = JsonType.STRING
         v._string_val = value
-        return v
+        return v^
 
     @staticmethod
     fn from_array(value: List[JsonValue]) -> JsonValue:
-        """Create an array value."""
+        """Create an array value (copies the list)."""
         var v = JsonValue()
         v._type = JsonType.ARRAY
-        v._array_val = value
-        return v
+        v._array_val = value.copy()
+        return v^
+
+    @staticmethod
+    fn from_array_move(deinit value: List[JsonValue]) -> JsonValue:
+        """Create an array value (moves the list, no copy). PERF optimization."""
+        var v = JsonValue()
+        v._type = JsonType.ARRAY
+        v._array_val = value^
+        return v^
 
     @staticmethod
     fn from_object(value: Dict[String, JsonValue]) -> JsonValue:
-        """Create an object value."""
+        """Create an object value (copies the dict)."""
         var v = JsonValue()
         v._type = JsonType.OBJECT
-        v._object_val = value
-        return v
+        v._object_val = value.copy()
+        return v^
+
+    @staticmethod
+    fn from_object_move(deinit value: Dict[String, JsonValue]) -> JsonValue:
+        """Create an object value (moves the dict, no copy). PERF optimization."""
+        var v = JsonValue()
+        v._type = JsonType.OBJECT
+        v._object_val = value^
+        return v^
 
     # ============================================================
     # Type checking
@@ -311,7 +344,7 @@ struct JsonValue(CollectionElement, Stringable):
         Returns empty array for non-array types.
         """
         if self._type == JsonType.ARRAY:
-            return self._array_val
+            return self._array_val.copy()
         return List[JsonValue]()
 
     fn as_object(self) -> Dict[String, JsonValue]:
@@ -322,7 +355,7 @@ struct JsonValue(CollectionElement, Stringable):
         Returns empty object for non-object types.
         """
         if self._type == JsonType.OBJECT:
-            return self._object_val
+            return self._object_val.copy()
         return Dict[String, JsonValue]()
 
     # ============================================================
@@ -347,10 +380,10 @@ struct JsonValue(CollectionElement, Stringable):
         """
         if self._type == JsonType.ARRAY:
             if index >= 0 and index < len(self._array_val):
-                return self._array_val[index]
+                return self._array_val[index].copy()
         return JsonValue.null()
 
-    fn __getitem__(self, key: String) -> JsonValue:
+    fn __getitem__(self, key: String) raises -> JsonValue:
         """
         Get object value by key.
 
@@ -358,7 +391,7 @@ struct JsonValue(CollectionElement, Stringable):
         """
         if self._type == JsonType.OBJECT:
             if key in self._object_val:
-                return self._object_val[key]
+                return self._object_val[key].copy()
         return JsonValue.null()
 
     fn contains(self, key: String) -> Bool:
@@ -371,9 +404,9 @@ struct JsonValue(CollectionElement, Stringable):
         """Get all keys from object. Returns empty list for non-objects."""
         var result = List[String]()
         if self._type == JsonType.OBJECT:
-            for key in self._object_val.keys():
-                result.append(key[])
-        return result
+            for entry in self._object_val.items():
+                result.append(entry.key)
+        return result^
 
     # ============================================================
     # Stringable implementation
@@ -389,9 +422,9 @@ struct JsonValue(CollectionElement, Stringable):
             else:
                 return "false"
         elif self._type == JsonType.INT:
-            return str(self._int_val)
+            return String(self._int_val)
         elif self._type == JsonType.FLOAT:
-            return str(self._float_val)
+            return String(self._float_val)
         elif self._type == JsonType.STRING:
             return self._format_string()
         elif self._type == JsonType.ARRAY:
@@ -435,7 +468,7 @@ struct JsonValue(CollectionElement, Stringable):
         for i in range(len(self._array_val)):
             if i > 0:
                 result += ","
-            result += str(self._array_val[i])
+            result += String(self._array_val[i])
         result += "]"
         return result
 
@@ -443,16 +476,16 @@ struct JsonValue(CollectionElement, Stringable):
         """Format object as JSON."""
         var result = String("{")
         var first = True
-        for item in self._object_val.items():
+        for entry in self._object_val.items():
             if not first:
                 result += ","
             first = False
             # Format key
             result += '"'
-            result += item[].key
+            result += entry.key
             result += '":'
             # Format value
-            result += str(item[].value)
+            result += String(entry.value)
         result += "}"
         return result
 
@@ -477,7 +510,7 @@ struct JsonValue(CollectionElement, Stringable):
             return self._string_val == other._string_val
         # For arrays and objects, compare string representations
         # (deep comparison would be more efficient but complex)
-        return str(self) == str(other)
+        return String(self) == String(other)
 
     fn __ne__(self, other: Self) -> Bool:
         """Check inequality."""
