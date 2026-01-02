@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Mojo
+        uses: modular/setup-mojo@v1
+        
+      - name: Run tests
+        run: |
+          for test_file in tests/test_*.mojo; do
+            if [ -f "$test_file" ]; then
+              echo "Running $test_file..."
+              mojo run "$test_file"
+            fi
+          done
+          
+      - name: Check formatting
+        run: mojo format --check src/
