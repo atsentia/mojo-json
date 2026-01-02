@@ -421,17 +421,32 @@ struct TapeParser:
     fn _parse_array(mut self, mut tape: JsonTape) raises:
         """Parse JSON array [...]."""
         var start_idx = tape.start_array()
+        var prev_pos = self.index.get_position(self.idx_pos)  # Position of '['
         self.idx_pos += 1  # Skip '['
 
         while self.idx_pos < len(self.index):
             var char = self.index.get_character(self.idx_pos)
+            var curr_pos = self.index.get_position(self.idx_pos)
 
             if char == RBRACKET:
+                # Parse any value between previous char and ]
+                if curr_pos > prev_pos + 1:
+                    self._parse_literal_between(tape, prev_pos + 1, curr_pos)
                 self.idx_pos += 1  # Skip ']'
                 tape.end_array(start_idx)
                 return
             elif char == COMMA:
+                # Parse value between previous char and this comma
+                if curr_pos > prev_pos + 1:
+                    self._parse_literal_between(tape, prev_pos + 1, curr_pos)
+                prev_pos = curr_pos
                 self.idx_pos += 1  # Skip ','
+            elif char == QUOTE or char == LBRACE or char == LBRACKET:
+                # Nested structure - parse it
+                self._parse_value(tape)
+                # Update prev_pos to after this structure
+                if self.idx_pos > 0 and self.idx_pos <= len(self.index):
+                    prev_pos = self.index.get_position(self.idx_pos - 1)
             else:
                 self._parse_value(tape)
 

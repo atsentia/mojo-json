@@ -281,7 +281,7 @@ fn run_benchmark_suite():
         var stage1_result = benchmark_stage1(json, ITERATIONS)
         var full_result = benchmark_full_parse(json, ITERATIONS)
 
-        print("  Size:", format_size(size), "| Objects:", obj_count[])
+        print("  Size:", format_size(size), "| Objects:", obj_count)
         print("    Stage 1 (SIMD scan):", stage1_result[0], "MB/s")
         print("    Full parse:         ", full_result[0], "MB/s")
         print("    Structural chars:   ", stage1_result[1])
