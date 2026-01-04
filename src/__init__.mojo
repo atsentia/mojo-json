@@ -168,6 +168,10 @@ from src.tape_parser import (
     # Parallel tape parser (throughput-optimized)
     ParallelTapeParser,
     parse_to_tape_parallel,
+    # On-demand parsing (ultra-fast for sparse access)
+    OnDemandDocument,
+    OnDemandValue,
+    parse_on_demand,
 )
 
 # Streaming parser
