@@ -97,6 +97,8 @@ from src.tape_parser import (
     JsonTape,
     TapeParser,
     LazyJsonValue,   # On-demand value extraction
+    LazyArrayIterator,   # Zero-alloc array iteration
+    LazyObjectIterator,  # Zero-alloc object iteration
 )
 
 # Serializer
