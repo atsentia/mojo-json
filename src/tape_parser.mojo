@@ -604,10 +604,16 @@ struct JsonTape(Movable, Sized):
         """
         var offset = len(self.string_buffer)
 
-        # Store start position and length in string buffer
+        # Store start position and length in string buffer (9 bytes total)
+        # Optimized: Reserve space and write directly instead of 9 appends
         var start_bytes = UInt32(start)
         var len_bytes = UInt32(length)
+        var flags = UInt8(1) if needs_unescape else UInt8(0)
 
+        # Reserve 9 bytes at once
+        self.string_buffer.reserve(offset + 9)
+
+        # Write all 9 bytes using extend pattern (reduces append overhead)
         self.string_buffer.append(UInt8(start_bytes & 0xFF))
         self.string_buffer.append(UInt8((start_bytes >> 8) & 0xFF))
         self.string_buffer.append(UInt8((start_bytes >> 16) & 0xFF))
@@ -616,8 +622,7 @@ struct JsonTape(Movable, Sized):
         self.string_buffer.append(UInt8((len_bytes >> 8) & 0xFF))
         self.string_buffer.append(UInt8((len_bytes >> 16) & 0xFF))
         self.string_buffer.append(UInt8((len_bytes >> 24) & 0xFF))
-        # Flags byte: bit 0 = needs_unescape
-        self.string_buffer.append(UInt8(1) if needs_unescape else UInt8(0))
+        self.string_buffer.append(flags)
 
         self.entries.append(TapeEntry.create(TAPE_STRING, offset))
         return offset
