@@ -39,6 +39,30 @@ alias TAPE_NULL: UInt8 = ord('n')
 
 alias PAYLOAD_MASK: UInt64 = 0x00FFFFFFFFFFFFFF
 
+# Compile-time character constants (avoid ord() runtime calls)
+alias CHAR_SPACE: UInt8 = 32      # ' '
+alias CHAR_TAB: UInt8 = 9         # '\t'
+alias CHAR_NEWLINE: UInt8 = 10    # '\n'
+alias CHAR_CR: UInt8 = 13         # '\r'
+alias CHAR_MINUS: UInt8 = 45      # '-'
+alias CHAR_PLUS: UInt8 = 43       # '+'
+alias CHAR_DOT: UInt8 = 46        # '.'
+alias CHAR_ZERO: UInt8 = 48       # '0'
+alias CHAR_NINE: UInt8 = 57       # '9'
+alias CHAR_E_LOWER: UInt8 = 101   # 'e'
+alias CHAR_E_UPPER: UInt8 = 69    # 'E'
+alias CHAR_T: UInt8 = 116         # 't'
+alias CHAR_F: UInt8 = 102         # 'f'
+alias CHAR_N: UInt8 = 110         # 'n'
+alias CHAR_QUOTE: UInt8 = 34      # '"'
+alias CHAR_LBRACE: UInt8 = 123    # '{'
+alias CHAR_RBRACE: UInt8 = 125    # '}'
+alias CHAR_LBRACKET: UInt8 = 91   # '['
+alias CHAR_RBRACKET: UInt8 = 93   # ']'
+alias CHAR_COLON: UInt8 = 58      # ':'
+alias CHAR_COMMA: UInt8 = 44      # ','
+alias CHAR_BACKSLASH: UInt8 = 92  # '\\'
+
 from memory import bitcast, ArcPointer
 
 
@@ -50,10 +74,10 @@ fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
     var result: Int64 = 0
 
     # Handle sign
-    if ptr[pos] == ord('-'):
+    if ptr[pos] == CHAR_MINUS:
         negative = True
         pos += 1
-    elif ptr[pos] == ord('+'):
+    elif ptr[pos] == CHAR_PLUS:
         pos += 1
 
     var digit_count = end - pos
@@ -79,12 +103,12 @@ fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
         var max2 = chunk2.reduce_max()
 
         # Check all 16 bytes are digits
-        var all_digits = (min1 >= ord('0') and max1 <= ord('9') and
-                         min2 >= ord('0') and max2 <= ord('9'))
+        var all_digits = (min1 >= CHAR_ZERO and max1 <= CHAR_NINE and
+                         min2 >= CHAR_ZERO and max2 <= CHAR_NINE)
 
         if all_digits:
             # Convert first 8 digits
-            var digits1 = (chunk1 - ord('0')).cast[DType.int64]()
+            var digits1 = (chunk1 - CHAR_ZERO).cast[DType.int64]()
             alias powers_high = SIMD[DType.int64, 8](
                 1000000000000000, 100000000000000, 10000000000000, 1000000000000,
                 100000000000, 10000000000, 1000000000, 100000000
@@ -92,7 +116,7 @@ fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
             var high_part = (digits1 * powers_high).reduce_add()
 
             # Convert second 8 digits
-            var digits2 = (chunk2 - ord('0')).cast[DType.int64]()
+            var digits2 = (chunk2 - CHAR_ZERO).cast[DType.int64]()
             alias powers_low = SIMD[DType.int64, 8](
                 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1
             )
@@ -112,11 +136,11 @@ fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
         # Check if all are digits: min >= '0' and max <= '9'
         var min_val = chunk.reduce_min()
         var max_val = chunk.reduce_max()
-        var all_digits = min_val >= ord('0') and max_val <= ord('9')
+        var all_digits = min_val >= CHAR_ZERO and max_val <= CHAR_NINE
 
         if all_digits:
             # Convert 8 digits in parallel
-            var digits = (chunk - ord('0')).cast[DType.int64]()
+            var digits = (chunk - CHAR_ZERO).cast[DType.int64]()
 
             # Multiply by powers of 10: [10^7, 10^6, ..., 10^0]
             alias powers = SIMD[DType.int64, 8](
@@ -128,12 +152,112 @@ fn _fast_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
     # Scalar path for remaining digits
     while pos < end:
         var c = ptr[pos]
-        if c < ord('0') or c > ord('9'):
+        if c < CHAR_ZERO or c > CHAR_NINE:
             break
-        result = result * 10 + Int64(c - ord('0'))
+        result = result * 10 + Int64(c - CHAR_ZERO)
         pos += 1
 
     return -result if negative else result
+
+
+@always_inline
+fn _fast_parse_float(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Float64:
+    """Fast float parsing without string allocation.
+
+    Parses: integer part . fractional part [e/E exponent]
+    """
+    var pos = start
+    var negative = False
+
+    # Handle sign
+    if pos < end and ptr[pos] == CHAR_MINUS:
+        negative = True
+        pos += 1
+    elif pos < end and ptr[pos] == CHAR_PLUS:
+        pos += 1
+
+    # Parse integer part
+    var int_part: Float64 = 0.0
+    while pos < end:
+        var c = ptr[pos]
+        if c < CHAR_ZERO or c > CHAR_NINE:
+            break
+        int_part = int_part * 10.0 + Float64(Int(c - CHAR_ZERO))
+        pos += 1
+
+    # Parse fractional part
+    var frac_part: Float64 = 0.0
+    var frac_scale: Float64 = 1.0
+    if pos < end and ptr[pos] == CHAR_DOT:
+        pos += 1
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_ZERO or c > CHAR_NINE:
+                break
+            frac_part = frac_part * 10.0 + Float64(Int(c - CHAR_ZERO))
+            frac_scale *= 10.0
+            pos += 1
+
+    var result = int_part + frac_part / frac_scale
+
+    # Parse exponent
+    if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
+        pos += 1
+        var exp_negative = False
+        if pos < end and ptr[pos] == CHAR_MINUS:
+            exp_negative = True
+            pos += 1
+        elif pos < end and ptr[pos] == CHAR_PLUS:
+            pos += 1
+
+        var exp: Int = 0
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_ZERO or c > CHAR_NINE:
+                break
+            exp = exp * 10 + Int(c - CHAR_ZERO)
+            pos += 1
+
+        # Apply exponent using precomputed powers
+        if exp_negative:
+            for _ in range(exp):
+                result /= 10.0
+        else:
+            for _ in range(exp):
+                result *= 10.0
+
+    return -result if negative else result
+
+
+@always_inline
+fn _skip_whitespace_simd(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int:
+    """Skip whitespace using SIMD. Returns position of first non-whitespace."""
+    var pos = start
+
+    # SIMD path: check 8 bytes at once
+    while pos + 8 <= end:
+        var chunk = SIMD[DType.uint8, 8]()
+        @parameter
+        for i in range(8):
+            chunk[i] = ptr[pos + i]
+
+        # Check each byte for non-whitespace and return early
+        # This is faster than building a SIMD mask for short runs
+        @parameter
+        for i in range(8):
+            var c = chunk[i]
+            if c != CHAR_SPACE and c != CHAR_TAB and c != CHAR_NEWLINE and c != CHAR_CR:
+                return pos + i
+        pos += 8
+
+    # Scalar fallback
+    while pos < end:
+        var c = ptr[pos]
+        if c != CHAR_SPACE and c != CHAR_TAB and c != CHAR_NEWLINE and c != CHAR_CR:
+            return pos
+        pos += 1
+
+    return pos
 
 
 @register_passable("trivial")
@@ -442,13 +566,8 @@ struct TapeParser:
         var ptr = self.source.unsafe_ptr()
         var n = len(self.source)
 
-        # Find start of value (skip whitespace after delimiter)
-        var start = delim_pos + 1
-        while start < n:
-            var c = ptr[start]
-            if c != ord(' ') and c != ord('\t') and c != ord('\n') and c != ord('\r'):
-                break
-            start += 1
+        # Find start of value (SIMD whitespace skip)
+        var start = _skip_whitespace_simd(ptr, delim_pos + 1, n)
 
         if start >= n:
             return
@@ -456,37 +575,37 @@ struct TapeParser:
         var c = ptr[start]
 
         # Check what the value is
-        if c == ord('{') or c == ord('[') or c == ord('"'):
+        if c == CHAR_LBRACE or c == CHAR_LBRACKET or c == CHAR_QUOTE:
             # These should be handled by structural index, advance and recurse
             self.idx_pos += 1
             self._parse_value(tape)
-        elif c == ord('t'):  # true
+        elif c == CHAR_T:  # true
             tape.append_true()
             self.idx_pos += 1  # Move past next structural char
-        elif c == ord('f'):  # false
+        elif c == CHAR_F:  # false
             tape.append_false()
             self.idx_pos += 1
-        elif c == ord('n'):  # null
+        elif c == CHAR_N:  # null
             tape.append_null()
             self.idx_pos += 1
-        elif c == ord('-') or (c >= ord('0') and c <= ord('9')):
+        elif c == CHAR_MINUS or (c >= CHAR_ZERO and c <= CHAR_NINE):
             # Number - find end
             var end = start + 1
             var is_float = False
 
             while end < n:
                 var nc = ptr[end]
-                if nc == ord('.') or nc == ord('e') or nc == ord('E'):
+                if nc == CHAR_DOT or nc == CHAR_E_LOWER or nc == CHAR_E_UPPER:
                     is_float = True
                     end += 1
-                elif nc == ord('-') or nc == ord('+') or (nc >= ord('0') and nc <= ord('9')):
+                elif nc == CHAR_MINUS or nc == CHAR_PLUS or (nc >= CHAR_ZERO and nc <= CHAR_NINE):
                     end += 1
                 else:
                     break
 
             if is_float:
-                var num_str = self.source[start:end]
-                tape.append_double(atof(num_str))
+                # Fast float parsing without string allocation
+                tape.append_double(_fast_parse_float(ptr, start, end))
             else:
                 # Fast path: parse integer directly
                 tape.append_int64(_fast_parse_int(ptr, start, end))
@@ -499,44 +618,40 @@ struct TapeParser:
         """Parse literal/number value between two source positions."""
         var ptr = self.source.unsafe_ptr()
         var n = len(self.source)
+        var limit = min(end, n)
 
-        # Skip leading whitespace
-        var pos = start
-        while pos < end and pos < n:
-            var c = ptr[pos]
-            if c != ord(' ') and c != ord('\t') and c != ord('\n') and c != ord('\r'):
-                break
-            pos += 1
+        # Skip leading whitespace (SIMD)
+        var pos = _skip_whitespace_simd(ptr, start, limit)
 
-        if pos >= end or pos >= n:
+        if pos >= limit:
             return
 
         var c = ptr[pos]
 
-        if c == ord('t'):  # true
+        if c == CHAR_T:  # true
             tape.append_true()
-        elif c == ord('f'):  # false
+        elif c == CHAR_F:  # false
             tape.append_false()
-        elif c == ord('n'):  # null
+        elif c == CHAR_N:  # null
             tape.append_null()
-        elif c == ord('-') or (c >= ord('0') and c <= ord('9')):
+        elif c == CHAR_MINUS or (c >= CHAR_ZERO and c <= CHAR_NINE):
             # Number - find end
             var num_end = pos + 1
             var is_float = False
 
-            while num_end < end and num_end < n:
+            while num_end < limit:
                 var nc = ptr[num_end]
-                if nc == ord('.') or nc == ord('e') or nc == ord('E'):
+                if nc == CHAR_DOT or nc == CHAR_E_LOWER or nc == CHAR_E_UPPER:
                     is_float = True
                     num_end += 1
-                elif nc == ord('-') or nc == ord('+') or (nc >= ord('0') and nc <= ord('9')):
+                elif nc == CHAR_MINUS or nc == CHAR_PLUS or (nc >= CHAR_ZERO and nc <= CHAR_NINE):
                     num_end += 1
                 else:
                     break
 
             if is_float:
-                var num_str = self.source[pos:num_end]
-                tape.append_double(atof(num_str))
+                # Fast float parsing without string allocation
+                tape.append_double(_fast_parse_float(ptr, pos, num_end))
             else:
                 # Fast path: parse integer directly without string allocation
                 tape.append_int64(_fast_parse_int(ptr, pos, num_end))
@@ -645,33 +760,32 @@ struct TapeParser:
 
         var c = ptr[pos]
 
-        if c == ord('t'):  # true
+        if c == CHAR_T:  # true
             tape.append_true()
-        elif c == ord('f'):  # false
+        elif c == CHAR_F:  # false
             tape.append_false()
-        elif c == ord('n'):  # null
+        elif c == CHAR_N:  # null
             tape.append_null()
-        elif c == ord('-') or (c >= ord('0') and c <= ord('9')):
+        elif c == CHAR_MINUS or (c >= CHAR_ZERO and c <= CHAR_NINE):
             # Number - find end
             var end = pos + 1
             var is_float = False
 
             while end < n:
                 var nc = ptr[end]
-                if nc == ord('.') or nc == ord('e') or nc == ord('E'):
+                if nc == CHAR_DOT or nc == CHAR_E_LOWER or nc == CHAR_E_UPPER:
                     is_float = True
                     end += 1
-                elif nc == ord('-') or nc == ord('+') or (nc >= ord('0') and nc <= ord('9')):
+                elif nc == CHAR_MINUS or nc == CHAR_PLUS or (nc >= CHAR_ZERO and nc <= CHAR_NINE):
                     end += 1
                 else:
                     break
 
-            # Parse number
-            var num_str = self.source[pos:end]
+            # Parse number without string allocation
             if is_float:
-                tape.append_double(atof(num_str))
+                tape.append_double(_fast_parse_float(ptr, pos, end))
             else:
-                tape.append_int64(atol(num_str))
+                tape.append_int64(_fast_parse_int(ptr, pos, end))
 
 
 fn parse_to_tape(json: String) raises -> JsonTape:
