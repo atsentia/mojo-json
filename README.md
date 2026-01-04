@@ -2,21 +2,38 @@
 
 A high-performance JSON library for Mojo with GPU acceleration. Pure Mojo, no external dependencies.
 
-## Performance Highlights
+## Performance Highlights (Apple M2 Max)
 
 | Configuration | Throughput | Use Case |
 |--------------|------------|----------|
 | **GPU (Metal)** | **4,300+ MB/s** | Large JSON (>64KB) |
-| CPU SIMD | 500+ MB/s | Standard parsing |
-| Lazy Parser | 2.2x faster | Partial access |
+| Adaptive Parser | 500-800 MB/s | Auto-selects best parser |
+| NDJSON Zero-Copy | 1,900+ MB/s | Line extraction |
+| On-Demand | 600+ MB/s | Sparse field access |
 
-GPU acceleration uses custom Metal shaders via FFI, achieving **4.3 GB/s** on Apple Silicon.
+### Standard Benchmark Results (M2 Max)
+
+| File | Size | V1 | V4 | Adaptive | Best For |
+|------|------|----|----|----------|----------|
+| twitter.json | 617 KB | **523 MB/s** | 469 MB/s | V1 | Web API payloads |
+| canada.json | 2.2 MB | 336 MB/s | **446 MB/s** | V4 | GeoJSON (coordinates) |
+| citm_catalog.json | 1.7 MB | **814 MB/s** | 748 MB/s | V1 | Nested structures |
+
+### NDJSON Processing (M2 Max)
+
+| Operation | Throughput | Speedup |
+|-----------|------------|---------|
+| Zero-copy extraction | 1,900 MB/s | **13.6x** vs copying |
+| Traditional extraction | 140 MB/s | Baseline |
+| Full parsing | 60-65 MB/s | Parsing dominates |
 
 ## Features
 
 - **GPU Acceleration** - Metal compute shaders for parallel classification (4,300+ MB/s)
+- **Adaptive Parser** - Auto-selects V1/V2/V4 based on content analysis (83-100% optimal)
+- **Zero-Copy NDJSON** - StringSlice extraction at 1.9 GB/s (13x faster)
 - **SIMD Optimized** - Vectorized structural scanning (500+ MB/s)
-- **Lazy Parsing** - Parse-on-demand for partial JSON access (2.2x speedup)
+- **On-Demand Parsing** - Parse-on-access for sparse field access (2x speedup)
 - **Full JSON Spec** - RFC 8259 compliant parser
 - **JsonValue Variant** - Type-safe representation of all JSON types
 - **Unicode Support** - Full handling including surrogate pairs
@@ -123,6 +140,71 @@ try:
     var value = parse('{"invalid": }')
 except e:
     print("Parse error:", e)
+```
+
+### Adaptive Parser (Auto-Select Best Parser)
+
+```mojo
+from mojo_json import parse_adaptive, analyze_json_content
+
+# Automatically selects V1, V2, or V4 based on content
+var tape = parse_adaptive(large_json)
+
+# Analyze content to see what parser will be selected
+var profile = analyze_json_content(json_string)
+print(profile)
+# JsonContentProfile(quotes=8%, digits=0%, structural=5%, recommended=V1)
+
+# Decision logic:
+# - >20% digits → V4 (number-heavy, like GeoJSON coordinates)
+# - >3% quotes  → V1 (string-heavy, like API responses)
+# - Otherwise   → V2 (balanced default)
+```
+
+### NDJSON Zero-Copy Processing
+
+```mojo
+from mojo_json import (
+    extract_line_slices,  # Zero-copy (recommended)
+    extract_lines,        # With copying
+    parse_to_tape,
+    StringSlice,
+    SliceList,
+)
+
+var ndjson = """
+{"name": "Alice", "age": 30}
+{"name": "Bob", "age": 25}
+{"name": "Charlie", "age": 35}
+"""
+
+# Zero-copy extraction (13x faster) - recommended
+var slices = extract_line_slices(ndjson)
+for i in range(len(slices)):
+    var line = slices[i]  # StringSlice - no allocation
+    # Only allocate string when actually parsing
+    var tape = parse_to_tape(line.to_string())
+    # Process tape...
+
+# Traditional extraction (slower, copies each line)
+var lines = extract_lines(ndjson)
+for i in range(len(lines)):
+    var tape = parse_to_tape(lines[i])
+```
+
+### On-Demand Parsing (Sparse Access)
+
+```mojo
+from mojo_json import parse_on_demand
+
+# Only builds structural index - values parsed on access
+var doc = parse_on_demand(huge_json)
+
+# Access specific fields (only these get parsed)
+var name = doc.root()["user"]["name"].get_string()
+var age = doc.root()["user"]["age"].get_int()
+
+# 50+ other fields in the JSON are never parsed
 ```
 
 ## API Reference

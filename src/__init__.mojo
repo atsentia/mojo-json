@@ -115,6 +115,10 @@ from src.tape_parser import (
     parse_fast,      # Fast parse returning JsonValue (~50x faster)
     parse_to_tape,   # Fastest - returns tape for O(1) access
     parse_lazy,      # Fastest with lazy extraction (~500 MB/s)
+    parse_adaptive,  # Auto-selects V1/V2/V4 based on content
+    analyze_json_content,  # Analyze JSON to determine best parser
+    get_recommended_parser,  # Get recommended parser name
+    JsonContentProfile,  # Content profile struct
     JsonTape,
     TapeParser,
     LazyJsonValue,   # On-demand value extraction
@@ -182,4 +186,32 @@ from src.streaming import (
     parse_streaming,
     count_elements,
     find_keys_at_depth,
+)
+
+# NDJSON parallel parser
+from src.ndjson import (
+    # Zero-copy line extraction (recommended)
+    extract_line_slices,
+    extract_line_slices_simd,
+    get_line_slice,
+    # Legacy line extraction (with copying)
+    parse_ndjson_parallel,
+    extract_lines,
+    extract_lines_simd,
+    # Line detection
+    find_line_boundaries,
+    find_line_boundaries_simd,
+    # Streaming iterator
+    NdjsonIterator,
+    # Statistics and sampling
+    ndjson_stats,
+    ndjson_sample,
+)
+
+# Zero-copy string slices
+from src.string_slice import (
+    StringSlice,
+    SliceList,
+    slice_from_string,
+    slice_between,
 )

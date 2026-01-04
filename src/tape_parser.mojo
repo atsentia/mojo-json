@@ -4692,3 +4692,173 @@ fn parse_on_demand(json: String) -> OnDemandDocument:
         # Other 50+ fields in response are never parsed
     """
     return OnDemandDocument(json)
+
+
+# =============================================================================
+# Adaptive Parser Selection
+# =============================================================================
+
+
+struct JsonContentProfile(Copyable, Movable, Stringable):
+    """Profile of JSON content for parser selection."""
+    var quote_ratio: Float64
+    var digit_ratio: Float64
+    var structural_ratio: Float64
+    var sample_size: Int
+    var recommended_parser: String
+
+    fn __init__(out self, quote_ratio: Float64, digit_ratio: Float64,
+                structural_ratio: Float64, sample_size: Int,
+                recommended_parser: String):
+        self.quote_ratio = quote_ratio
+        self.digit_ratio = digit_ratio
+        self.structural_ratio = structural_ratio
+        self.sample_size = sample_size
+        self.recommended_parser = recommended_parser
+
+    fn __copyinit__(out self, existing: Self):
+        self.quote_ratio = existing.quote_ratio
+        self.digit_ratio = existing.digit_ratio
+        self.structural_ratio = existing.structural_ratio
+        self.sample_size = existing.sample_size
+        self.recommended_parser = existing.recommended_parser
+
+    fn __moveinit__(out self, deinit existing: Self):
+        self.quote_ratio = existing.quote_ratio
+        self.digit_ratio = existing.digit_ratio
+        self.structural_ratio = existing.structural_ratio
+        self.sample_size = existing.sample_size
+        self.recommended_parser = existing.recommended_parser^
+
+    fn __str__(self) -> String:
+        return (
+            "JsonContentProfile(quotes=" + String(Int(self.quote_ratio * 100)) + "%, "
+            "digits=" + String(Int(self.digit_ratio * 100)) + "%, "
+            "structural=" + String(Int(self.structural_ratio * 100)) + "%, "
+            "recommended=" + self.recommended_parser + ")"
+        )
+
+
+fn analyze_json_content(json: String, sample_size: Int = 1024) -> JsonContentProfile:
+    """
+    Analyze JSON content to determine optimal parser.
+
+    Samples the first N bytes and classifies character types.
+    Returns a profile with recommended parser.
+
+    Args:
+        json: JSON string to analyze.
+        sample_size: Number of bytes to sample (default 1024).
+
+    Returns:
+        JsonContentProfile with character ratios and recommendation.
+    """
+    var ptr = json.unsafe_ptr()
+    var n = min(len(json), sample_size)
+
+    var quote_count = 0
+    var digit_count = 0
+    var structural_count = 0  # {, }, [, ], :, ,
+    var in_string = False
+
+    for i in range(n):
+        var c = ptr[i]
+
+        if c == ord('"') and (i == 0 or ptr[i - 1] != ord('\\')):
+            in_string = not in_string
+            quote_count += 1
+        elif not in_string:
+            if c >= ord('0') and c <= ord('9'):
+                digit_count += 1
+            elif c == ord('.') or c == ord('-') or c == ord('+') or c == ord('e') or c == ord('E'):
+                # Part of number
+                digit_count += 1
+            elif c == ord('{') or c == ord('}') or c == ord('[') or c == ord(']') or c == ord(':') or c == ord(','):
+                structural_count += 1
+
+    var quote_ratio = Float64(quote_count) / Float64(n) if n > 0 else 0.0
+    var digit_ratio = Float64(digit_count) / Float64(n) if n > 0 else 0.0
+    var structural_ratio = Float64(structural_count) / Float64(n) if n > 0 else 0.0
+
+    # Decision logic based on benchmarks:
+    # - V1 wins for string-heavy (citm_catalog: lots of quotes)
+    # - V4 wins for number-heavy (canada.json: lots of coordinates)
+    # - V2 is balanced default
+    #
+    # Thresholds tuned on standard benchmark files:
+    # - twitter.json: 4% quotes → V1 (7% faster than V2)
+    # - canada.json: 76% digits → V4 (18% faster than V2)
+    # - citm_catalog: 8% quotes → V1 (14% faster than V2)
+    var recommended: String
+    if digit_ratio > 0.20:  # Number-heavy (>20% digits) - check first
+        recommended = "V4"
+    elif quote_ratio > 0.03:  # String-heavy (>3% quotes)
+        recommended = "V1"
+    else:
+        recommended = "V2"
+
+    return JsonContentProfile(
+        quote_ratio,
+        digit_ratio,
+        structural_ratio,
+        n,
+        recommended
+    )
+
+
+fn parse_adaptive(json: String) raises -> JsonTape:
+    """
+    Parse JSON using the optimal parser based on content analysis.
+
+    Automatically selects between V1, V2, and V4 parsers based on
+    a quick analysis of the JSON content:
+    - V1: Best for string-heavy JSON (many quoted values)
+    - V2: Balanced default (good all-around)
+    - V4: Best for number-heavy JSON (coordinates, metrics)
+
+    Performance:
+    - Analysis overhead: ~0.5μs for 1KB sample
+    - Can provide 10-30% speedup by avoiding suboptimal parser
+
+    Example:
+        # Automatically picks best parser
+        var tape = parse_adaptive(json_string)
+
+        # Or analyze first to understand content
+        var profile = analyze_json_content(json_string)
+        print(profile)  # Shows content ratios and recommendation
+
+    Args:
+        json: JSON string to parse.
+
+    Returns:
+        JsonTape parsed with optimal parser.
+    """
+    var profile = analyze_json_content(json)
+
+    if profile.recommended_parser == "V1":
+        return parse_to_tape(json)
+    elif profile.recommended_parser == "V4":
+        return parse_to_tape_v4(json)
+    else:
+        return parse_to_tape_v2(json)
+
+
+fn get_recommended_parser(json: String) -> String:
+    """
+    Get the recommended parser name without parsing.
+
+    Useful for debugging or logging which parser will be selected.
+
+    Example:
+        var parser = get_recommended_parser(json)
+        print("Will use:", parser)  # "V1", "V2", or "V4"
+
+    Args:
+        json: JSON string to analyze.
+
+    Returns:
+        Parser name: "V1", "V2", or "V4".
+    """
+    var profile = analyze_json_content(json)
+    return profile.recommended_parser

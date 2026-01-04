@@ -154,3 +154,330 @@ fn classify_kernel(
 1. **Batch Processing**: Process multiple JSON documents in one GPU call
 2. **Full GPU Pipeline**: GPU-native string state tracking with prefix scan
 3. **Multi-GPU**: Distribute large files across GPU cores
+
+---
+
+## GpJSON Analysis (2026-01)
+
+Analyzed [GpJSON](https://github.com/koesie10/gpjson), a CUDA-based JSON parser achieving 15-25 GB/s on NVIDIA GPUs.
+
+### Architecture: Multi-Pass GPU Pipeline
+
+```
+Pass 1: create_escape_index      → 64-bit bitmap of escaped chars
+Pass 2: create_quote_index       → 64-bit bitmap of unescaped quotes
+Pass 3: create_string_index      → Prefix-XOR for in-string tracking
+Pass 4: create_leveled_bitmaps   → Structural chars by nesting level
+Pass 5: find_value               → Query execution using indexes
+```
+
+### Key Algorithm: Prefix-XOR String Tracking
+
+GpJSON uses the same algorithm as simdjson for tracking which characters are inside strings:
+
+```c
+// Converts quote bit positions to contiguous in-string mask
+quotes ^= quotes << 1;
+quotes ^= quotes << 2;
+quotes ^= quotes << 4;
+quotes ^= quotes << 8;
+quotes ^= quotes << 16;
+quotes ^= quotes << 32;
+```
+
+This transforms isolated quote bits into a mask where all characters inside strings have bit=1.
+
+### Carry Propagation
+
+Each kernel stores carry state for the next thread:
+- **Escape carry**: Was the last char a backslash?
+- **Quote count parity**: Odd/even quote count determines string state
+- **Nesting level**: Current depth for leveled bitmaps
+
+### NDJSON Optimization
+
+GpJSON is optimized for **newline-delimited JSON** where each line is independent:
+- One JSON record per GPU thread (embarrassingly parallel)
+- No cross-line state dependencies
+- Ideal for log processing and streaming analytics
+
+For single large JSON documents, parallelization is more complex due to state dependencies across the entire file.
+
+### Applicability to mojo-json
+
+| GpJSON Feature | Mojo Applicability | Notes |
+|----------------|-------------------|-------|
+| 64-bit bitmaps | ✅ Direct port | Use UInt64 for masks |
+| Prefix-XOR | ✅ Direct port | Pure arithmetic |
+| Carry propagation | ✅ With threads | Need parallel prefix sum |
+| Leveled bitmaps | ✅ Useful | Speeds up depth navigation |
+| NDJSON parallel | ✅ High value | Easy parallelism |
+| CUDA kernels | ❌ Not yet | Mojo lacks CUDA support |
+
+### Recommended Implementation Path
+
+1. **Short-term**: Add prefix-XOR string tracking to CPU Stage 1
+2. **Medium-term**: Add NDJSON parallel processing mode
+3. **Long-term**: Port full pipeline when Mojo GPU matures
+
+---
+
+## Comprehensive Hardware Acceleration Analysis (2026-01)
+
+Deep analysis of all Apple Silicon acceleration options for JSON parsing.
+
+### 1. mojo-metal (GPU via Metal) ✅ RECOMMENDED
+
+**Location**: `/Users/amund/mojo-metal`
+
+**Status**: Working GPU kernels using Mojo's native `DeviceContext` API.
+
+**Architecture**:
+```mojo
+from gpu.host import DeviceContext
+from gpu import block_idx, block_dim, thread_idx
+from layout import Layout, LayoutTensor
+
+fn classify_kernel(
+    input: LayoutTensor[DType.uint8, layout, MutableAnyOrigin],
+    output: LayoutTensor[DType.uint8, layout, MutableAnyOrigin],
+):
+    var tid = block_idx.x * block_dim.x + thread_idx.x
+    if tid < size:
+        output[tid] = classify_char(input[tid])
+```
+
+**Key Capabilities**:
+- Unary/binary/reduce GPU kernels implemented
+- Device abstraction via `MetalDevice` struct
+- 8-14x speedup for large tensors (>64K elements)
+- ~15μs kernel launch overhead
+- Supports M1-M5 with NAX detection for M3+
+
+**JSON Parsing Fit**: EXCELLENT
+- Character classification: embarrassingly parallel
+- Each thread processes 1-4 bytes
+- Can leverage MLX-style prefix scan for string tracking
+
+### 2. MLX Metal Kernels Reference
+
+**Key Files Analyzed**:
+- `mlx/backend/metal/kernels/scan.h` - Prefix scan implementation
+- `mlx/backend/metal/kernels/scan.metal` - Kernel instantiations
+
+**Critical Finding: GPU Prefix Scan**
+
+MLX implements hardware-accelerated prefix scans using Metal's SIMD primitives:
+
+```metal
+// MLX scan.h - Three-level parallel prefix scan
+U simd_scan_impl(U x) {
+    return simd_prefix_inclusive_sum(x);  // Hardware instruction!
+}
+
+// For types without hardware support, use shuffle pattern:
+for (int i = 1; i <= 16; i *= 2) {
+    val = operator()(val, simd_shuffle_and_fill_up(val, init, i));
+}
+```
+
+**Algorithm Structure**:
+1. Per-thread scan (N_READS elements)
+2. Simdgroup-level exclusive scan via `simd_prefix_exclusive_sum`
+3. Cross-simdgroup scan via shared memory
+4. Combine prefix + simdgroup_sum + thread_sum
+
+**JSON Application**: The prefix-XOR for string tracking CAN be implemented on GPU using this pattern, replacing `sum` with `xor`.
+
+### 3. Apple Neural Engine (ANE) ❌ NOT SUITABLE
+
+**Research Sources**:
+- [hollance/neural-engine](https://github.com/hollance/neural-engine)
+- [Apple ML Research](https://machinelearning.apple.com/research/neural-engine-transformers)
+
+**Why ANE Won't Work for JSON Parsing**:
+
+1. **No Public API**: ANE is only accessible via CoreML's automatic scheduling
+2. **Custom Layers Can't Use ANE**: CoreML custom layers run on CPU/GPU only
+3. **Wrong Operation Domain**: ANE optimized for:
+   - Matrix multiply (INT8, FP16)
+   - Convolutions
+   - Activation functions
+   - NOT byte-level comparisons or prefix scans
+
+4. **Data Format Constraints**: ANE buffers must be 64-byte aligned on last axis, causing 32-64x memory overhead for byte operations
+
+**Quote from Apple**:
+> "Because there is no public API to program the ANE, custom layers cannot run on the ANE."
+
+### 4. Apple AMX (Matrix Coprocessor) ⚠️ INDIRECT ACCESS ONLY
+
+**Research Sources**:
+- [corsix/amx](https://github.com/corsix/amx) - Reverse-engineered instruction set
+- [Meekolab Research](https://research.meekolab.com/the-elusive-apple-matrix-coprocessor-amx)
+
+**What AMX Is**:
+- Undocumented matrix coprocessor in Apple Silicon
+- 32x32 grid of 16-bit multiply-accumulate units
+- ~1475 GFLOPS on M1 Max (vs 102 GFLOPS for NEON)
+- 2x faster than NEON for matrix operations
+
+**Access Methods**:
+1. **Accelerate Framework** (Recommended): BLAS, vDSP automatically use AMX
+2. **Direct Assembly** (Undocumented): Risk of breaking on future chips
+3. **M4+**: ARM SME (Scalable Matrix Extension) provides documented access
+
+**JSON Parsing Fit**: POOR
+- AMX designed for dense matrix multiply
+- JSON parsing is sparse (1-5% structural characters)
+- Byte comparisons don't map to matrix ops
+- Potential use: Batch float parsing (not the bottleneck)
+
+### 5. Accelerate Framework (vDSP, BNNS)
+
+**Available Operations**:
+- `vDSP_vthres`: Threshold operations
+- `vDSP_vcmprs`: Compress vectors by condition
+- `BNNS`: Neural network primitives
+
+**JSON Parsing Fit**: LIMITED
+- Could use `vDSP_vthres` to find specific byte values
+- Overhead of framework calls may exceed benefit
+- Better to use direct SIMD (already implemented)
+
+### 6. tinygrad Metal Backend Reference
+
+**Key Implementation** (`ops_metal.py`):
+- Uses `MTLCompileOptions` with fast-math
+- Buffer management via `newBufferWithLength_options_` with shared storage
+- Kernel dispatch via `MTLComputeCommandEncoder`
+- 32-thread simdgroups (matching Apple GPU architecture)
+
+**Relevance**: Shows how to build efficient Metal compute from Python/high-level language. Similar patterns applicable to Mojo.
+
+### 7. llama.cpp Metal Reference
+
+**Key File**: `ggml-metal.metal` (~15K lines)
+
+**Optimization Patterns**:
+- `#define N_SIMDWIDTH 32` - Consistent with Apple GPU
+- Heavy use of `simd_shuffle` for cross-lane communication
+- `FOR_UNROLL` pragma for loop unrolling
+- Quantized operations (INT4, INT8, FP8)
+
+**JSON Parsing Relevance**: Limited - focused on matrix ops for LLM inference.
+
+---
+
+## Feasibility Summary
+
+| Accelerator | Feasibility | Expected Speedup | JSON Fit |
+|-------------|-------------|------------------|----------|
+| **Metal GPU (mojo-metal)** | ✅ High | 2-5x for >100KB | Excellent |
+| **MLX-style Prefix Scan** | ✅ High | Key enabler | Excellent |
+| **ANE** | ❌ None | N/A | None |
+| **AMX** | ⚠️ Indirect | Minor | Poor |
+| **Accelerate vDSP** | ⚠️ Low | Minor | Limited |
+| **Multi-core CPU** | ✅ High | 2-4x (8 cores) | Excellent |
+
+---
+
+## Recommended Implementation Strategy
+
+### Phase 1: GPU Character Classification (mojo-metal)
+
+Use existing mojo-metal infrastructure:
+
+```mojo
+from mojo_metal.device import MetalDevice
+
+fn classify_chars_gpu(json: String) -> List[UInt8]:
+    var device = MetalDevice()
+    var size = len(json)
+
+    # Allocate buffers
+    var in_buf = device.create_buffer[DType.uint8](size)
+    var out_buf = device.create_buffer[DType.uint8](size)
+
+    # Launch kernel
+    var num_blocks = (size + 255) // 256
+    device.ctx.enqueue_function_checked[classify_kernel, classify_kernel](
+        in_tensor, out_tensor, size,
+        grid_dim=num_blocks, block_dim=256,
+    )
+
+    device.synchronize()
+    return result
+```
+
+### Phase 2: GPU Prefix-XOR (Port from MLX)
+
+Implement `CumXor` operation following MLX's scan pattern:
+
+```metal
+// Custom CumXor for string tracking (port to Mojo)
+struct CumXor<U> {
+    static constexpr constant U init = 0;
+
+    U operator()(U a, U b) { return a ^ b; }
+
+    U simd_scan(U x) {
+        for (int i = 1; i <= 16; i *= 2) {
+            x ^= simd_shuffle_and_fill_up(x, init, i);
+        }
+        return x;
+    }
+};
+```
+
+### Phase 3: Full GPU Pipeline
+
+```
+JSON Input
+    │
+    ▼
+[GPU] Character Classification (embarrassingly parallel)
+    │
+    ▼
+[GPU] Quote Bitmap (parallel comparison)
+    │
+    ▼
+[GPU] String Index (prefix-XOR scan)
+    │
+    ▼
+[GPU] Structural Character Extraction (parallel filter)
+    │
+    ▼
+[CPU] Value Parsing (On-Demand API)
+```
+
+### Phase 4: NDJSON Parallel Processing
+
+For newline-delimited JSON (logs, streaming data):
+
+```mojo
+fn parse_ndjson_parallel(data: String) -> List[JsonValue]:
+    # Find newline positions (GPU or CPU)
+    var lines = find_line_boundaries(data)
+
+    # Process lines in parallel (one per thread/core)
+    var results = List[JsonValue]()
+    parallel_for(lines) fn(line_start, line_end):
+        var line_json = data[line_start:line_end]
+        results.append(parse_on_demand(line_json))
+
+    return results
+```
+
+---
+
+## References
+
+- [mojo-metal](file:///Users/amund/mojo-metal) - Local GPU library
+- [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
+- [GpJSON](https://github.com/koesie10/gpjson) - CUDA JSON parser
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) - LLM inference with Metal
+- [tinygrad](https://github.com/tinygrad/tinygrad) - ML framework with Metal backend
+- [hollance/neural-engine](https://github.com/hollance/neural-engine) - ANE reverse engineering
+- [corsix/amx](https://github.com/corsix/amx) - AMX instruction set
+- [Apple Accelerate](https://developer.apple.com/documentation/accelerate) - SIMD/BLAS framework
