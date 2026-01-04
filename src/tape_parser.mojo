@@ -15,6 +15,7 @@ from .structural_index import (
     build_structural_index,
     build_structural_index_v2,
     build_structural_index_v3,
+    build_structural_index_v4,
     StructuralIndex,
     ValueSpan,
     QUOTE,
@@ -57,6 +58,203 @@ alias CHAR_E_LOWER: UInt8 = 101  # 'e'
 alias CHAR_E_UPPER: UInt8 = 69   # 'E'
 
 from memory import bitcast
+
+
+# =============================================================================
+# SWAR Number Parsing Helpers (Phase 3 Optimization)
+# =============================================================================
+#
+# SWAR = SIMD Within A Register
+# Parse 8 digits at once using 64-bit integer operations
+#
+# Key insight: Use 64-bit arithmetic to process multiple bytes in parallel
+# - Load 8 bytes into a UInt64
+# - Subtract '0' from each byte in parallel
+# - Validate all bytes are digits
+# - Combine using multiplication
+
+
+@always_inline
+fn _swar_parse_8_digits(ptr: UnsafePointer[UInt8], pos: Int) -> Tuple[UInt64, Bool]:
+    """
+    Parse up to 8 digits using SWAR technique.
+
+    Returns (value, valid) where valid=True if all 8 bytes are digits.
+    If fewer than 8 digits before non-digit, returns partial result with valid=False.
+    """
+    # Load 8 bytes into a single 64-bit value (little-endian)
+    var chunk: UInt64 = 0
+    for i in range(8):
+        chunk |= UInt64(ptr[pos + i]) << (i * 8)
+
+    # Subtract '0' (0x30) from each byte
+    # Magic constant: 0x3030303030303030 = '0' repeated 8 times
+    alias zeros = UInt64(0x3030303030303030)
+    var digits = chunk - zeros
+
+    # Check if all bytes are in range 0-9
+    # After subtracting '0', valid digits are 0x00-0x09
+    # Invalid chars become >= 0x0A or wrap to negative (high bit set)
+    # Magic: (digit | (0x09 - digit)) has high bit set if digit > 9
+    alias nines = UInt64(0x0909090909090909)
+    alias high_bits = UInt64(0x8080808080808080)
+    var invalid = (digits | (nines - digits)) & high_bits
+
+    if invalid != 0:
+        return (0, False)
+
+    # All 8 bytes are valid digits!
+    # Extract each byte and combine: d0 + d1*10 + d2*100 + ...
+    # Or equivalently for little-endian: d0*10^7 + d1*10^6 + ...
+    var d0 = (digits) & 0xFF
+    var d1 = (digits >> 8) & 0xFF
+    var d2 = (digits >> 16) & 0xFF
+    var d3 = (digits >> 24) & 0xFF
+    var d4 = (digits >> 32) & 0xFF
+    var d5 = (digits >> 40) & 0xFF
+    var d6 = (digits >> 48) & 0xFF
+    var d7 = (digits >> 56) & 0xFF
+
+    # Combine: first byte is highest digit in left-to-right reading
+    var result = (d0 * 10000000 + d1 * 1000000 + d2 * 100000 + d3 * 10000 +
+                  d4 * 1000 + d5 * 100 + d6 * 10 + d7)
+
+    return (result, True)
+
+
+@always_inline
+fn _swar_count_digits(ptr: UnsafePointer[UInt8], pos: Int, max_len: Int) -> Int:
+    """Count consecutive digit characters starting at pos."""
+    var count = 0
+    while count < max_len:
+        var c = ptr[pos + count]
+        if c < CHAR_0 or c > CHAR_9:
+            break
+        count += 1
+    return count
+
+
+@always_inline
+fn _swar_parse_float(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Float64:
+    """
+    SWAR-optimized float parsing.
+
+    Optimized for typical JSON floats (e.g., GeoJSON coordinates like -65.613617).
+    Uses 8-digit SWAR parsing for integer and fractional parts.
+    """
+    var pos = start
+    var negative = False
+
+    # Handle negative
+    if ptr[pos] == CHAR_MINUS:
+        negative = True
+        pos += 1
+
+    # Count integer part digits
+    var int_start = pos
+    var remaining = end - pos
+    var int_digits = _swar_count_digits(ptr, pos, remaining)
+
+    var mantissa: UInt64 = 0
+    var frac_digits = 0
+
+    # Parse integer part
+    if int_digits >= 8:
+        # Use SWAR for first 8 digits
+        var result = _swar_parse_8_digits(ptr, pos)
+        mantissa = result[0]
+        pos += 8
+        int_digits -= 8
+        # Parse remaining integer digits one by one
+        while int_digits > 0 and pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + UInt64(c - CHAR_0)
+            pos += 1
+            int_digits -= 1
+    else:
+        # Few digits, parse directly
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + UInt64(c - CHAR_0)
+            pos += 1
+
+    # Parse fractional part
+    if pos < end and ptr[pos] == CHAR_DOT:
+        pos += 1
+        var frac_start = pos
+
+        # Count fractional digits
+        remaining = end - pos
+        frac_digits = _swar_count_digits(ptr, pos, remaining)
+
+        if frac_digits >= 8:
+            # Use SWAR for first 8 fractional digits
+            var result = _swar_parse_8_digits(ptr, pos)
+            if result[1]:  # All 8 are valid digits
+                mantissa = mantissa * 100000000 + result[0]
+                pos += 8
+                frac_digits = 8
+                # Parse any remaining fractional digits
+                var extra_frac = 0
+                while pos < end:
+                    var c = ptr[pos]
+                    if c < CHAR_0 or c > CHAR_9:
+                        break
+                    mantissa = mantissa * 10 + UInt64(c - CHAR_0)
+                    extra_frac += 1
+                    pos += 1
+                frac_digits += extra_frac
+            else:
+                # Less than 8 valid digits, fall back
+                while pos < end:
+                    var c = ptr[pos]
+                    if c < CHAR_0 or c > CHAR_9:
+                        break
+                    mantissa = mantissa * 10 + UInt64(c - CHAR_0)
+                    pos += 1
+                frac_digits = pos - frac_start
+        else:
+            # Few fractional digits, parse directly
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                mantissa = mantissa * 10 + UInt64(c - CHAR_0)
+                pos += 1
+            frac_digits = pos - frac_start
+
+    # Parse exponent part
+    var exponent = -frac_digits  # Decimal shift from fractional part
+
+    if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
+        pos += 1
+        var exp_negative = False
+
+        if pos < end and ptr[pos] == CHAR_MINUS:
+            exp_negative = True
+            pos += 1
+        elif pos < end and ptr[pos] == CHAR_PLUS:
+            pos += 1
+
+        var exp_val = 0
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            exp_val = exp_val * 10 + Int(c - CHAR_0)
+            pos += 1
+
+        if exp_negative:
+            exponent -= exp_val
+        else:
+            exponent += exp_val
+
+    var result = _apply_exponent(Float64(mantissa), exponent)
+    return -result if negative else result
 
 
 # =============================================================================
@@ -1605,6 +1803,249 @@ fn parse_to_tape_v3(json: String) raises -> JsonTape:
         # ~10-20% faster Stage 1 on large files
     """
     var parser = TapeParserV3(json)
+    return parser.parse()
+
+
+# =============================================================================
+# TapeParserV4: Branchless Character Classification
+# =============================================================================
+
+
+struct TapeParserV4:
+    """
+    V4 parser using branchless character classification.
+
+    Uses lookup table for character classification instead of conditional
+    comparisons, eliminating branches in the hot Stage 1 path.
+    """
+
+    var source: String
+    var index: StructuralIndex
+    var idx_pos: Int
+
+    fn __init__(out self, source: String):
+        self.source = source
+        self.index = build_structural_index_v4(source)  # V4 uses branchless lookup
+        self.idx_pos = 0
+
+    fn parse(mut self) raises -> JsonTape:
+        """Parse JSON into tape representation using V4 indexed values."""
+        var tape = JsonTape(capacity=len(self.index))
+        tape.source = self.source
+        tape.append_root()
+
+        if len(self.index) == 0:
+            tape.finalize()
+            return tape^
+
+        self.idx_pos = 0
+        self._parse_value(tape)
+        tape.finalize()
+        return tape^
+
+    fn _parse_value(mut self, mut tape: JsonTape) raises:
+        """Parse a single JSON value."""
+        if self.idx_pos >= len(self.index):
+            return
+
+        var char = self.index.get_character(self.idx_pos)
+
+        if char == LBRACE:
+            self._parse_object(tape)
+        elif char == LBRACKET:
+            self._parse_array(tape)
+        elif char == QUOTE:
+            self._parse_string(tape)
+
+    fn _parse_string(mut self, mut tape: JsonTape) raises:
+        """Parse JSON string with escape detection."""
+        var start_pos = self.index.get_position(self.idx_pos)
+        self.idx_pos += 1  # Skip opening quote
+
+        var end_pos = start_pos + 1
+        if self.idx_pos < len(self.index):
+            var next_char = self.index.get_character(self.idx_pos)
+            if next_char == QUOTE:
+                end_pos = self.index.get_position(self.idx_pos)
+                self.idx_pos += 1  # Skip closing quote
+
+        var str_start = start_pos + 1
+        var str_len = end_pos - start_pos - 1
+        var needs_unescape = self._string_has_escape(str_start, str_len)
+
+        _ = tape.append_string_ref(str_start, str_len, needs_unescape)
+
+    @always_inline
+    fn _string_has_escape(self, start: Int, length: Int) -> Bool:
+        """Quick scan for backslash in string."""
+        if length == 0:
+            return False
+
+        var ptr = self.source.unsafe_ptr()
+        for i in range(length):
+            if ptr[start + i] == 0x5C:  # backslash
+                return True
+        return False
+
+    @always_inline
+    fn _use_value_span(mut self, mut tape: JsonTape, span: ValueSpan) raises:
+        """Use pre-computed value span."""
+        var ptr = self.source.unsafe_ptr()
+        var start = Int(span.start)
+        var end = Int(span.end)
+
+        if span.value_type == VALUE_NUMBER:
+            if span.is_float == 1:
+                tape.append_double(self._fast_parse_float_inline(start, end))
+            else:
+                tape.append_int64(self._fast_parse_int_inline(start, end))
+        elif span.value_type == VALUE_TRUE:
+            tape.append_true()
+        elif span.value_type == VALUE_FALSE:
+            tape.append_false()
+        elif span.value_type == VALUE_NULL:
+            tape.append_null()
+
+    @always_inline
+    fn _fast_parse_int_inline(self, start: Int, end: Int) -> Int64:
+        """Fast integer parsing."""
+        var ptr = self.source.unsafe_ptr()
+        var pos = start
+        var result: Int64 = 0
+        var negative = False
+
+        if ptr[pos] == CHAR_MINUS:
+            negative = True
+            pos += 1
+
+        while pos < end:
+            var digit = Int64(ptr[pos]) - 48
+            result = result * 10 + digit
+            pos += 1
+
+        return -result if negative else result
+
+    @always_inline
+    fn _fast_parse_float_inline(self, start: Int, end: Int) -> Float64:
+        """Fast float parsing with inlined common exponents."""
+        var ptr = self.source.unsafe_ptr()
+        var pos = start
+        var result: Float64 = 0.0
+        var negative = False
+
+        if ptr[pos] == CHAR_MINUS:
+            negative = True
+            pos += 1
+
+        # Integer part
+        while pos < end and ptr[pos] >= CHAR_0 and ptr[pos] <= CHAR_9:
+            result = result * 10.0 + Float64(Int(ptr[pos]) - 48)
+            pos += 1
+
+        # Fractional part
+        if pos < end and ptr[pos] == CHAR_DOT:
+            pos += 1
+            var frac_mult: Float64 = 0.1
+            while pos < end and ptr[pos] >= CHAR_0 and ptr[pos] <= CHAR_9:
+                result += Float64(Int(ptr[pos]) - 48) * frac_mult
+                frac_mult *= 0.1
+                pos += 1
+
+        # Exponent part
+        if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
+            pos += 1
+            var exp_negative = False
+
+            if pos < end and ptr[pos] == CHAR_MINUS:
+                exp_negative = True
+                pos += 1
+            elif pos < end and ptr[pos] == CHAR_PLUS:
+                pos += 1
+
+            var exponent = 0
+            while pos < end and ptr[pos] >= CHAR_0 and ptr[pos] <= CHAR_9:
+                exponent = exponent * 10 + (Int(ptr[pos]) - 48)
+                pos += 1
+
+            if exp_negative:
+                exponent = -exponent
+
+            result = _apply_exponent(result, exponent)
+
+        return -result if negative else result
+
+    fn _parse_object(mut self, mut tape: JsonTape) raises:
+        """Parse JSON object."""
+        var start_idx = tape.start_object()
+        self.idx_pos += 1  # Skip {
+
+        while self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+
+            if char == RBRACE:
+                self.idx_pos += 1
+                tape.end_object(start_idx)
+                return
+            elif char == QUOTE:
+                self._parse_string(tape)
+                if self.idx_pos < len(self.index):
+                    var next_char = self.index.get_character(self.idx_pos)
+                    if next_char == COLON:
+                        var span = self.index.get_value_span(self.idx_pos)
+                        self.idx_pos += 1
+                        if span.value_type != VALUE_UNKNOWN:
+                            self._use_value_span(tape, span)
+                        else:
+                            self._parse_value(tape)
+            elif char == COMMA:
+                self.idx_pos += 1
+            else:
+                self.idx_pos += 1
+
+    fn _parse_array(mut self, mut tape: JsonTape) raises:
+        """Parse JSON array."""
+        var start_idx = tape.start_array()
+        var first_span = self.index.get_value_span(self.idx_pos)
+        self.idx_pos += 1  # Skip [
+
+        # First element
+        if first_span.value_type != VALUE_UNKNOWN:
+            self._use_value_span(tape, first_span)
+        elif self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+            if char != RBRACKET and char != COMMA:
+                self._parse_value(tape)
+
+        while self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+
+            if char == RBRACKET:
+                self.idx_pos += 1
+                tape.end_array(start_idx)
+                return
+            elif char == COMMA:
+                var span = self.index.get_value_span(self.idx_pos)
+                self.idx_pos += 1
+                if span.value_type != VALUE_UNKNOWN:
+                    self._use_value_span(tape, span)
+                else:
+                    self._parse_value(tape)
+            else:
+                self._parse_value(tape)
+
+
+fn parse_to_tape_v4(json: String) raises -> JsonTape:
+    """
+    V4 JSON parsing with branchless character classification.
+
+    Uses lookup table for character classification instead of conditional
+    comparisons, eliminating branches in the hot Stage 1 path.
+
+    Example:
+        var tape = parse_to_tape_v4(large_json)
+        # Branchless Stage 1 for better pipelining
+    """
+    var parser = TapeParserV4(json)
     return parser.parse()
 
 
