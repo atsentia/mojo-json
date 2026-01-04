@@ -613,3 +613,225 @@ fn benchmark_structural_scan(data: String, iterations: Int) -> Float64:
     var throughput_mbps = total_bytes / (1024.0 * 1024.0) / seconds
 
     return throughput_mbps
+
+
+# =============================================================================
+# Parallel Structural Index Builder
+# =============================================================================
+
+from algorithm import parallelize
+
+
+fn _count_unescaped_quotes_in_range(
+    ptr: UnsafePointer[UInt8], start: Int, end: Int
+) -> Int:
+    """Count unescaped quotes in a byte range."""
+    var count = 0
+    var i = start
+
+    # SIMD scan for quotes
+    while i + SIMD_WIDTH <= end:
+        var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
+        @parameter
+        for j in range(SIMD_WIDTH):
+            chunk[j] = ptr[i + j]
+
+        @parameter
+        for j in range(SIMD_WIDTH):
+            if chunk[j] == QUOTE:
+                # Check if escaped
+                var escaped = False
+                if i + j > start:
+                    escaped = ptr[i + j - 1] == BACKSLASH
+                elif i + j > 0:
+                    escaped = ptr[i + j - 1] == BACKSLASH
+                if not escaped:
+                    count += 1
+        i += SIMD_WIDTH
+
+    # Scalar tail
+    while i < end:
+        if ptr[i] == QUOTE:
+            var escaped = i > 0 and ptr[i - 1] == BACKSLASH
+            if not escaped:
+                count += 1
+        i += 1
+
+    return count
+
+
+fn _build_index_range(
+    ptr: UnsafePointer[UInt8],
+    start: Int,
+    end: Int,
+    initial_in_string: Bool,
+) -> StructuralIndex:
+    """Build structural index for a byte range."""
+    var index = StructuralIndex(capacity=(end - start) // 4)
+    var in_string = initial_in_string
+    var i = start
+
+    # SIMD processing
+    while i + SIMD_WIDTH <= end:
+        var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
+        @parameter
+        for j in range(SIMD_WIDTH):
+            chunk[j] = ptr[i + j]
+
+        var structural_mask = _create_structural_mask(chunk)
+        var backslash_mask = _create_backslash_mask(chunk)
+        var struct_count = structural_mask.reduce_add()
+
+        if struct_count == 0:
+            i += SIMD_WIDTH
+            continue
+
+        @parameter
+        for j in range(SIMD_WIDTH):
+            var c = chunk[j]
+
+            if c == QUOTE:
+                var escaped = False
+                if j > 0:
+                    escaped = backslash_mask[j - 1] == 1
+                elif i + j > 0:
+                    escaped = ptr[i + j - 1] == BACKSLASH
+
+                if not escaped:
+                    in_string = not in_string
+                    index.append(i + j, c)
+            elif not in_string and structural_mask[j] == 1:
+                index.append(i + j, c)
+
+        i += SIMD_WIDTH
+
+    # Scalar tail
+    while i < end:
+        var c = ptr[i]
+        if c == QUOTE:
+            var escaped = i > 0 and ptr[i - 1] == BACKSLASH
+            if not escaped:
+                in_string = not in_string
+                index.append(i, c)
+        elif not in_string and _is_structural(c):
+            index.append(i, c)
+        i += 1
+
+    return index^
+
+
+fn build_structural_index_parallel(
+    data: String, num_threads: Int = 4
+) -> StructuralIndex:
+    """
+    Build structural index using parallel chunk processing.
+
+    Strategy:
+    1. Count unescaped quotes in each chunk (parallel)
+    2. Compute string state at chunk boundaries (prefix sum)
+    3. Build partial indices (parallel) using separate allocations
+    4. Merge partial indices
+
+    Best for files > 500KB. For smaller files, single-threaded is faster.
+    """
+    var n = len(data)
+
+    # For small files, use single-threaded
+    if n < 512 * 1024:
+        return build_structural_index(data)
+
+    var ptr = data.unsafe_ptr()
+    var chunk_size = n // num_threads
+
+    # Phase 1: Count quotes in each chunk (parallel)
+    var quote_counts = List[Int]()
+    for _ in range(num_threads):
+        quote_counts.append(0)
+
+    var counts_ptr = quote_counts.unsafe_ptr()
+
+    @parameter
+    fn count_quotes(tid: Int):
+        var start = tid * chunk_size
+        var end = (tid + 1) * chunk_size if tid < num_threads - 1 else n
+        counts_ptr[tid] = _count_unescaped_quotes_in_range(ptr, start, end)
+
+    parallelize[count_quotes](num_threads)
+
+    # Phase 2: Compute string state at each chunk boundary (prefix sum)
+    var chunk_in_string = List[Bool]()
+    var total_quotes = 0
+    for i in range(num_threads):
+        chunk_in_string.append((total_quotes % 2) == 1)
+        total_quotes += quote_counts[i]
+
+    # Phase 3: Allocate separate position/char arrays for each thread
+    var positions_per_thread = List[List[Int]]()
+    var chars_per_thread = List[List[UInt8]]()
+    for _ in range(num_threads):
+        positions_per_thread.append(List[Int]())
+        chars_per_thread.append(List[UInt8]())
+
+    # Build indices in parallel (each thread writes to its own list)
+    @parameter
+    fn build_chunk(tid: Int):
+        var start = tid * chunk_size
+        var end = (tid + 1) * chunk_size if tid < num_threads - 1 else n
+        var in_string = chunk_in_string[tid]
+        var i = start
+
+        # SIMD processing
+        while i + SIMD_WIDTH <= end:
+            var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
+            @parameter
+            for j in range(SIMD_WIDTH):
+                chunk[j] = ptr[i + j]
+
+            var structural_mask = _create_structural_mask(chunk)
+            var backslash_mask = _create_backslash_mask(chunk)
+
+            @parameter
+            for j in range(SIMD_WIDTH):
+                var c = chunk[j]
+                if c == QUOTE:
+                    var escaped = False
+                    if j > 0:
+                        escaped = backslash_mask[j - 1] == 1
+                    elif i + j > 0:
+                        escaped = ptr[i + j - 1] == BACKSLASH
+                    if not escaped:
+                        in_string = not in_string
+                        positions_per_thread[tid].append(i + j)
+                        chars_per_thread[tid].append(c)
+                elif not in_string and structural_mask[j] == 1:
+                    positions_per_thread[tid].append(i + j)
+                    chars_per_thread[tid].append(c)
+            i += SIMD_WIDTH
+
+        # Scalar tail
+        while i < end:
+            var c = ptr[i]
+            if c == QUOTE:
+                var escaped = i > 0 and ptr[i - 1] == BACKSLASH
+                if not escaped:
+                    in_string = not in_string
+                    positions_per_thread[tid].append(i)
+                    chars_per_thread[tid].append(c)
+            elif not in_string and _is_structural(c):
+                positions_per_thread[tid].append(i)
+                chars_per_thread[tid].append(c)
+            i += 1
+
+    parallelize[build_chunk](num_threads)
+
+    # Phase 4: Merge partial indices
+    var total_size = 0
+    for i in range(num_threads):
+        total_size += len(positions_per_thread[i])
+
+    var result = StructuralIndex(capacity=total_size)
+    for i in range(num_threads):
+        for j in range(len(positions_per_thread[i])):
+            result.append(positions_per_thread[i][j], chars_per_thread[i][j])
+
+    return result^
