@@ -137,6 +137,9 @@ from src.tape_parser import (
     # Compressed tape with string interning (memory-optimized)
     CompressedJsonTape,
     parse_to_tape_compressed,
+    # Parallel tape parser (throughput-optimized)
+    ParallelTapeParser,
+    parse_to_tape_parallel,
 )
 
 # Streaming parser
