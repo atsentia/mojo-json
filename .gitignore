@@ -23,3 +23,8 @@ benchmarks/data/*_10mb.json
 # OS
 .DS_Store
 *.mojopkg
+
+# Large benchmark data files
+benchmarks/data/twitter.json
+benchmarks/data/canada.json
+benchmarks/data/citm_catalog.json
