@@ -19,7 +19,7 @@ from src import (
 # ============================================================
 
 
-fn test_null_value() raises:
+fn test_null_value():
     """Test null value creation and access."""
     var value = JsonValue.null()
 
@@ -31,7 +31,7 @@ fn test_null_value() raises:
     assert_equal(String(value), "null")
 
 
-fn test_bool_value() raises:
+fn test_bool_value():
     """Test boolean value creation and access."""
     var true_val = JsonValue.from_bool(True)
     var false_val = JsonValue.from_bool(False)
@@ -45,7 +45,7 @@ fn test_bool_value() raises:
     assert_equal(String(false_val), "false")
 
 
-fn test_int_value() raises:
+fn test_int_value():
     """Test integer value creation and access."""
     var value = JsonValue.from_int(42)
 
@@ -60,7 +60,7 @@ fn test_int_value() raises:
     assert_equal(String(neg), "-100")
 
 
-fn test_float_value() raises:
+fn test_float_value():
     """Test float value creation and access."""
     var value = JsonValue.from_float(3.14159)
 
@@ -74,7 +74,7 @@ fn test_float_value() raises:
     assert_true(diff < 0.00001, "Float value should match")
 
 
-fn test_string_value() raises:
+fn test_string_value():
     """Test string value creation and access."""
     var value = JsonValue.from_string("hello, world!")
 
@@ -83,7 +83,7 @@ fn test_string_value() raises:
     assert_equal(String(value), '"hello, world!"')
 
 
-fn test_array_value() raises:
+fn test_array_value():
     """Test array value creation and access."""
     var arr = List[JsonValue]()
     arr.append(JsonValue.from_int(1))
@@ -100,7 +100,7 @@ fn test_array_value() raises:
     assert_equal(String(value), "[1,2,3]")
 
 
-fn test_object_value() raises:
+fn test_object_value():
     """Test object value creation and access."""
     var obj = Dict[String, JsonValue]()
     obj["name"] = JsonValue.from_string("Alice")
@@ -235,25 +235,25 @@ fn test_parse_whitespace() raises:
     assert_equal(value["key"].as_string(), "value")
 
 
-fn test_parse_safe_success() raises:
+fn test_parse_safe_success():
     """Test parse_safe with valid JSON."""
     var result = parse_safe('{"valid": true}')
-    var is_ok = result[2]
+    var is_ok = result.get[2, Bool]()
     assert_true(is_ok, "Should succeed")
 
     if is_ok:
-        var value = result[0].copy()
+        var value = result.get[0, JsonValue]()
         assert_true(value["valid"].as_bool(), "Value should be true")
 
 
-fn test_parse_safe_failure() raises:
+fn test_parse_safe_failure():
     """Test parse_safe with invalid JSON."""
     var result = parse_safe('{"invalid": }')
-    var is_ok = result[2]
+    var is_ok = result.get[2, Bool]()
     assert_false(is_ok, "Should fail")
 
     if not is_ok:
-        var error = result[1].copy()
+        var error = result.get[1, JsonParseError]()
         assert_true(len(error.message) > 0, "Should have error message")
 
 
@@ -262,7 +262,7 @@ fn test_parse_safe_failure() raises:
 # ============================================================
 
 
-fn test_serialize_primitives() raises:
+fn test_serialize_primitives():
     """Test serializing primitive values."""
     assert_equal(serialize(JsonValue.null()), "null")
     assert_equal(serialize(JsonValue.from_bool(True)), "true")
@@ -271,7 +271,7 @@ fn test_serialize_primitives() raises:
     assert_equal(serialize(JsonValue.from_string("hello")), '"hello"')
 
 
-fn test_serialize_array() raises:
+fn test_serialize_array():
     """Test serializing arrays."""
     var arr = List[JsonValue]()
     arr.append(JsonValue.from_int(1))
@@ -282,7 +282,7 @@ fn test_serialize_array() raises:
     assert_equal(serialize(value), "[1,2,3]")
 
 
-fn test_serialize_object() raises:
+fn test_serialize_object():
     """Test serializing objects."""
     var obj = Dict[String, JsonValue]()
     obj["key"] = JsonValue.from_string("value")
@@ -291,7 +291,7 @@ fn test_serialize_object() raises:
     assert_equal(serialize(value), '{"key":"value"}')
 
 
-fn test_serialize_escape_strings() raises:
+fn test_serialize_escape_strings():
     """Test that strings are properly escaped."""
     var with_quote = JsonValue.from_string('say "hello"')
     assert_equal(serialize(with_quote), '"say \\"hello\\""')
@@ -300,7 +300,7 @@ fn test_serialize_escape_strings() raises:
     assert_equal(serialize(with_newline), '"line1\\nline2"')
 
 
-fn test_serialize_pretty() raises:
+fn test_serialize_pretty():
     """Test pretty-printed serialization."""
     var obj = Dict[String, JsonValue]()
     obj["name"] = JsonValue.from_string("Test")
@@ -330,7 +330,7 @@ fn test_roundtrip() raises:
 # ============================================================
 
 
-fn test_error_format() raises:
+fn test_error_format():
     """Test error formatting."""
     var error = JsonParseError("Test error", 10, 2, 5)
     var formatted = error.format()

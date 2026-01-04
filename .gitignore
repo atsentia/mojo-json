@@ -23,6 +23,12 @@ benchmarks/data/*_10mb.json
 # OS
 .DS_Store
 *.mojopkg
+
 # Large benchmark files (download separately)
 benchmarks/data/citylots*.json
 benchmarks/rust_bench/target/
+
+# Large benchmark data files
+benchmarks/data/twitter.json
+benchmarks/data/canada.json
+benchmarks/data/citm_catalog.json
