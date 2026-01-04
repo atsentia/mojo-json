@@ -46,6 +46,15 @@ alias TAPE_NULL: UInt8 = ord('n')
 
 alias PAYLOAD_MASK: UInt64 = 0x00FFFFFFFFFFFFFF
 
+# Character constants for number parsing (compile-time for better optimization)
+alias CHAR_MINUS: UInt8 = 45     # '-'
+alias CHAR_PLUS: UInt8 = 43      # '+'
+alias CHAR_DOT: UInt8 = 46       # '.'
+alias CHAR_0: UInt8 = 48         # '0'
+alias CHAR_9: UInt8 = 57         # '9'
+alias CHAR_E_LOWER: UInt8 = 101  # 'e'
+alias CHAR_E_UPPER: UInt8 = 69   # 'E'
+
 from memory import bitcast
 
 
@@ -1121,7 +1130,7 @@ struct TapeParserV2:
         Fast float parsing without string allocation.
 
         Uses direct byte access for mantissa/exponent extraction.
-        Based on Lemire's fast_float algorithm principles.
+        Uses compile-time character constants for optimization.
         """
         var ptr = self.source.unsafe_ptr()
         var pos = start
@@ -1130,36 +1139,45 @@ struct TapeParserV2:
         var exponent: Int = 0
 
         # Check for negative
-        if ptr[pos] == ord('-'):
+        if ptr[pos] == CHAR_MINUS:
             negative = True
             pos += 1
 
         # Integer part
-        while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-            mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + Int64(c - CHAR_0)
             pos += 1
 
         # Fractional part
-        if pos < end and ptr[pos] == ord('.'):
+        if pos < end and ptr[pos] == CHAR_DOT:
             pos += 1
-            while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-                mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                mantissa = mantissa * 10 + Int64(c - CHAR_0)
                 exponent -= 1
                 pos += 1
 
         # Exponent part
-        if pos < end and (ptr[pos] == ord('e') or ptr[pos] == ord('E')):
+        if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
             pos += 1
             var exp_negative = False
-            if pos < end and ptr[pos] == ord('-'):
+            if pos < end and ptr[pos] == CHAR_MINUS:
                 exp_negative = True
                 pos += 1
-            elif pos < end and ptr[pos] == ord('+'):
+            elif pos < end and ptr[pos] == CHAR_PLUS:
                 pos += 1
 
             var exp_val: Int = 0
-            while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-                exp_val = exp_val * 10 + Int(ptr[pos] - ord('0'))
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                exp_val = exp_val * 10 + Int(c - CHAR_0)
                 pos += 1
 
             if exp_negative:
@@ -1167,37 +1185,7 @@ struct TapeParserV2:
             else:
                 exponent += exp_val
 
-        # Combine mantissa and exponent
-        var result = Float64(mantissa)
-
-        # Apply exponent using lookup table for small exponents
-        if exponent >= 0:
-            if exponent <= 22:
-                # Use lookup table for 10^0 to 10^22
-                var pow10_table = SIMD[DType.float64, 8](1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0)
-                if exponent < 8:
-                    result *= pow10_table[exponent]
-                elif exponent < 16:
-                    result *= pow10_table[7] * pow10_table[exponent - 7]
-                else:
-                    result *= pow10_table[7] * pow10_table[7] * pow10_table[exponent - 14]
-            else:
-                for _ in range(exponent):
-                    result *= 10.0
-        else:
-            var neg_exp = -exponent
-            if neg_exp <= 22:
-                var pow10_table = SIMD[DType.float64, 8](1.0, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001, 0.0000001)
-                if neg_exp < 8:
-                    result *= pow10_table[neg_exp]
-                elif neg_exp < 16:
-                    result *= pow10_table[7] * pow10_table[neg_exp - 7]
-                else:
-                    result *= pow10_table[7] * pow10_table[7] * pow10_table[neg_exp - 14]
-            else:
-                for _ in range(neg_exp):
-                    result *= 0.1
-
+        var result = _apply_exponent(Float64(mantissa), exponent)
         return -result if negative else result
 
     @always_inline
@@ -1480,60 +1468,69 @@ struct CompressedTapeParser:
             tape.append_null()
 
     fn _fast_parse_int_inline(self, start: Int, end: Int) -> Int64:
-        """Fast integer parsing."""
+        """Fast integer parsing using character constants."""
         var ptr = self.source.unsafe_ptr()
         var pos = start
         var negative = False
 
-        if ptr[pos] == ord('-'):
+        if ptr[pos] == CHAR_MINUS:
             negative = True
             pos += 1
 
         var result: Int64 = 0
         while pos < end:
             var c = ptr[pos]
-            if c < ord('0') or c > ord('9'):
+            if c < CHAR_0 or c > CHAR_9:
                 break
-            result = result * 10 + Int64(c - ord('0'))
+            result = result * 10 + Int64(c - CHAR_0)
             pos += 1
 
         return -result if negative else result
 
     fn _fast_parse_float_inline(self, start: Int, end: Int) -> Float64:
-        """Fast float parsing."""
+        """Fast float parsing using character constants."""
         var ptr = self.source.unsafe_ptr()
         var pos = start
         var negative = False
         var mantissa: Int64 = 0
         var exponent: Int = 0
 
-        if ptr[pos] == ord('-'):
+        if ptr[pos] == CHAR_MINUS:
             negative = True
             pos += 1
 
-        while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-            mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + Int64(c - CHAR_0)
             pos += 1
 
-        if pos < end and ptr[pos] == ord('.'):
+        if pos < end and ptr[pos] == CHAR_DOT:
             pos += 1
-            while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-                mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                mantissa = mantissa * 10 + Int64(c - CHAR_0)
                 exponent -= 1
                 pos += 1
 
-        if pos < end and (ptr[pos] == ord('e') or ptr[pos] == ord('E')):
+        if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
             pos += 1
             var exp_negative = False
-            if pos < end and ptr[pos] == ord('-'):
+            if pos < end and ptr[pos] == CHAR_MINUS:
                 exp_negative = True
                 pos += 1
-            elif pos < end and ptr[pos] == ord('+'):
+            elif pos < end and ptr[pos] == CHAR_PLUS:
                 pos += 1
 
             var exp_val: Int = 0
-            while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-                exp_val = exp_val * 10 + Int(ptr[pos] - ord('0'))
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                exp_val = exp_val * 10 + Int(c - CHAR_0)
                 pos += 1
 
             if exp_negative:
@@ -1541,14 +1538,7 @@ struct CompressedTapeParser:
             else:
                 exponent += exp_val
 
-        var result = Float64(mantissa)
-        if exponent > 0:
-            for _ in range(exponent):
-                result *= 10.0
-        elif exponent < 0:
-            for _ in range(-exponent):
-                result *= 0.1
-
+        var result = _apply_exponent(Float64(mantissa), exponent)
         return -result if negative else result
 
     fn _parse_object(mut self, mut tape: CompressedJsonTape) raises:
@@ -2554,24 +2544,79 @@ struct ParallelTapeParser:
 
 # Thread-safe number parsing functions (no shared state)
 
+
+@always_inline
+fn _apply_exponent(value: Float64, exponent: Int) -> Float64:
+    """
+    Apply power-of-10 exponent with inlined common cases.
+
+    Most JSON floats (coordinates, sensor data) have exponents in [-10, 10].
+    We inline these for maximum performance.
+    """
+    if exponent == 0:
+        return value
+    elif exponent == -1:
+        return value * 0.1
+    elif exponent == -2:
+        return value * 0.01
+    elif exponent == -3:
+        return value * 0.001
+    elif exponent == -4:
+        return value * 0.0001
+    elif exponent == -5:
+        return value * 0.00001
+    elif exponent == -6:
+        return value * 0.000001
+    elif exponent == -7:
+        return value * 0.0000001
+    elif exponent == -8:
+        return value * 0.00000001
+    elif exponent == -9:
+        return value * 0.000000001
+    elif exponent == -10:
+        return value * 0.0000000001
+    elif exponent == 1:
+        return value * 10.0
+    elif exponent == 2:
+        return value * 100.0
+    elif exponent == 3:
+        return value * 1000.0
+    elif exponent == 4:
+        return value * 10000.0
+    elif exponent == 5:
+        return value * 100000.0
+    elif exponent > 0:
+        # Positive exponent > 5
+        var result = value
+        for _ in range(exponent):
+            result *= 10.0
+        return result
+    else:
+        # Negative exponent < -10
+        var result = value
+        for _ in range(-exponent):
+            result *= 0.1
+        return result
+
+
 @always_inline
 fn _parallel_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64:
-    """Thread-safe integer parsing."""
+    """Thread-safe integer parsing using character constants."""
     var pos = start
     var negative = False
 
-    if ptr[pos] == ord('-'):
+    if ptr[pos] == CHAR_MINUS:
         negative = True
         pos += 1
-    elif ptr[pos] == ord('+'):
+    elif ptr[pos] == CHAR_PLUS:
         pos += 1
 
     var result: Int64 = 0
     while pos < end:
         var c = ptr[pos]
-        if c < ord('0') or c > ord('9'):
+        if c < CHAR_0 or c > CHAR_9:
             break
-        result = result * 10 + Int64(c - ord('0'))
+        result = result * 10 + Int64(c - CHAR_0)
         pos += 1
 
     return -result if negative else result
@@ -2579,58 +2624,63 @@ fn _parallel_parse_int(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Int64
 
 @always_inline
 fn _parallel_parse_float(ptr: UnsafePointer[UInt8], start: Int, end: Int) -> Float64:
-    """Thread-safe float parsing."""
+    """
+    Thread-safe float parsing with optimized power-of-10 lookup.
+
+    Uses compile-time character constants and inlined exponent application
+    for maximum performance on coordinate-heavy data.
+    """
     var pos = start
     var negative = False
     var mantissa: Int64 = 0
     var exponent: Int = 0
 
-    if ptr[pos] == ord('-'):
+    if ptr[pos] == CHAR_MINUS:
         negative = True
         pos += 1
-    elif ptr[pos] == ord('+'):
+    elif ptr[pos] == CHAR_PLUS:
         pos += 1
 
     # Integer part
-    while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-        mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+    while pos < end:
+        var c = ptr[pos]
+        if c < CHAR_0 or c > CHAR_9:
+            break
+        mantissa = mantissa * 10 + Int64(c - CHAR_0)
         pos += 1
 
     # Fractional part
-    if pos < end and ptr[pos] == ord('.'):
+    if pos < end and ptr[pos] == CHAR_DOT:
         pos += 1
-        while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-            mantissa = mantissa * 10 + Int64(ptr[pos] - ord('0'))
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + Int64(c - CHAR_0)
             exponent -= 1
             pos += 1
 
     # Exponent part
-    if pos < end and (ptr[pos] == ord('e') or ptr[pos] == ord('E')):
+    if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
         pos += 1
         var exp_neg = False
-        if pos < end and ptr[pos] == ord('-'):
+        if pos < end and ptr[pos] == CHAR_MINUS:
             exp_neg = True
             pos += 1
-        elif pos < end and ptr[pos] == ord('+'):
+        elif pos < end and ptr[pos] == CHAR_PLUS:
             pos += 1
 
         var exp_val = 0
-        while pos < end and ptr[pos] >= ord('0') and ptr[pos] <= ord('9'):
-            exp_val = exp_val * 10 + Int(ptr[pos] - ord('0'))
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            exp_val = exp_val * 10 + Int(c - CHAR_0)
             pos += 1
 
         exponent += -exp_val if exp_neg else exp_val
 
-    var result = Float64(mantissa)
-
-    # Apply exponent (simple power-of-10)
-    if exponent > 0:
-        for _ in range(exponent):
-            result *= 10.0
-    elif exponent < 0:
-        for _ in range(-exponent):
-            result *= 0.1
-
+    var result = _apply_exponent(Float64(mantissa), exponent)
     return -result if negative else result
 
 

@@ -304,6 +304,14 @@ fn _is_number_char(c: UInt8) -> Bool:
 
 
 @always_inline
+fn _is_digit_branchless(c: UInt8) -> Bool:
+    """Branchless digit check using unsigned subtraction."""
+    # (c - '0') <= 9 is true iff c is '0'-'9'
+    # Using unsigned arithmetic, non-digits wrap to large values
+    return (c - 48) <= 9
+
+
+@always_inline
 fn _scan_number(ptr: UnsafePointer[UInt8], start: Int, n: Int) -> Tuple[Int, Bool]:
     """
     Scan a number starting at position start.
@@ -317,14 +325,14 @@ fn _scan_number(ptr: UnsafePointer[UInt8], start: Int, n: Int) -> Tuple[Int, Boo
         pos += 1
 
     # Integer part
-    while pos < n and _is_digit(ptr[pos]):
+    while pos < n and _is_digit_branchless(ptr[pos]):
         pos += 1
 
     # Fractional part
     if pos < n and ptr[pos] == ord('.'):
         is_float = True
         pos += 1
-        while pos < n and _is_digit(ptr[pos]):
+        while pos < n and _is_digit_branchless(ptr[pos]):
             pos += 1
 
     # Exponent part
@@ -333,7 +341,7 @@ fn _scan_number(ptr: UnsafePointer[UInt8], start: Int, n: Int) -> Tuple[Int, Boo
         pos += 1
         if pos < n and (ptr[pos] == ord('-') or ptr[pos] == ord('+')):
             pos += 1
-        while pos < n and _is_digit(ptr[pos]):
+        while pos < n and _is_digit_branchless(ptr[pos]):
             pos += 1
 
     return (pos, is_float)
