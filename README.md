@@ -6,10 +6,30 @@ A high-performance JSON library for Mojo with GPU acceleration. Pure Mojo, no ex
 
 | Configuration | Throughput | Use Case |
 |--------------|------------|----------|
-| **GPU (Metal)** | **4,300+ MB/s** | Large JSON (>64KB) |
+| **GPU (Metal)** | **2,589 MB/s** | Large JSON (>64KB) |
 | Adaptive Parser | 500-800 MB/s | Auto-selects best parser |
 | NDJSON Zero-Copy | 1,900+ MB/s | Line extraction |
 | On-Demand | 600+ MB/s | Sparse field access |
+
+### GPU Acceleration (M2 Max)
+
+GPU character classification via Metal FFI - **no Mojo Metal compiler needed**:
+
+| JSON Size | GPU | CPU SIMD | Winner |
+|-----------|-----|----------|--------|
+| 16 KB | 51 MB/s | 500 MB/s | CPU |
+| 64 KB | 281 MB/s | 500 MB/s | Crossover |
+| 256 KB | **1,007 MB/s** | 500 MB/s | GPU 2x |
+| 1 MB | **2,589 MB/s** | 500 MB/s | GPU 5x |
+
+```mojo
+from src.gpu_parser import parse_adaptive_gpu
+
+# Auto-selects GPU (>64KB) or CPU (<64KB)
+var tape = parse_adaptive_gpu(large_json)
+```
+
+Build GPU support: `cd metal && ./build_all.sh`
 
 ### Standard Benchmark Results (M2 Max)
 
@@ -29,7 +49,7 @@ A high-performance JSON library for Mojo with GPU acceleration. Pure Mojo, no ex
 
 ## Features
 
-- **GPU Acceleration** - Metal compute shaders for parallel classification (4,300+ MB/s)
+- **GPU Acceleration** - Metal compute shaders via FFI (2.5 GB/s for 1MB+)
 - **Adaptive Parser** - Auto-selects V1/V2/V4 based on content analysis (83-100% optimal)
 - **Zero-Copy NDJSON** - StringSlice extraction at 1.9 GB/s (13x faster)
 - **SIMD Optimized** - Vectorized structural scanning (500+ MB/s)

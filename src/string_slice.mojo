@@ -378,7 +378,7 @@ struct SliceList(Sized):
         self._source = source
         self._offsets = List[Tuple[Int, Int]]()
 
-    fn __moveinit__(out self, owned existing: Self):
+    fn __moveinit__(out self, deinit existing: Self):
         """Move constructor."""
         self._source = existing._source^
         self._offsets = existing._offsets^

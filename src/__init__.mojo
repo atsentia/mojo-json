@@ -215,3 +215,17 @@ from src.string_slice import (
     slice_from_string,
     slice_between,
 )
+
+# GPU-accelerated parsing (Metal FFI)
+from src.gpu_parser import (
+    parse_gpu,           # Force GPU parsing
+    parse_adaptive_gpu,  # Auto-select GPU/CPU based on size
+    should_use_gpu,      # Check if GPU recommended for size
+    GPU_THRESHOLD,       # 64 KB threshold
+)
+
+# Metal FFI utilities
+from src.metal_ffi import (
+    MetalJsonClassifier,
+    is_metal_available,
+)
