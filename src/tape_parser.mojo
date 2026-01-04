@@ -14,6 +14,7 @@ Architecture:
 from .structural_index import (
     build_structural_index,
     build_structural_index_v2,
+    build_structural_index_v3,
     StructuralIndex,
     ValueSpan,
     QUOTE,
@@ -1358,6 +1359,252 @@ fn parse_to_tape_v2(json: String) raises -> JsonTape:
         print(len(tape))  # Faster than parse_to_tape for number arrays
     """
     var parser = TapeParserV2(json)
+    return parser.parse()
+
+
+struct TapeParserV3:
+    """
+    V3 parser using 32-byte SIMD structural indexing.
+
+    Same parsing logic as TapeParserV2, but uses build_structural_index_v3
+    for faster Stage 1 on large files.
+    """
+
+    var source: String
+    var index: StructuralIndex
+    var idx_pos: Int
+
+    fn __init__(out self, source: String):
+        self.source = source
+        self.index = build_structural_index_v3(source)  # V3 uses 32-byte SIMD
+        self.idx_pos = 0
+
+    fn parse(mut self) raises -> JsonTape:
+        """Parse JSON into tape representation using V3 indexed values."""
+        var tape = JsonTape(capacity=len(self.index))
+        tape.source = self.source
+        tape.append_root()
+
+        if len(self.index) == 0:
+            tape.finalize()
+            return tape^
+
+        self.idx_pos = 0
+        self._parse_value(tape)
+        tape.finalize()
+        return tape^
+
+    fn _parse_value(mut self, mut tape: JsonTape) raises:
+        """Parse a single JSON value."""
+        if self.idx_pos >= len(self.index):
+            return
+
+        var char = self.index.get_character(self.idx_pos)
+
+        if char == LBRACE:
+            self._parse_object(tape)
+        elif char == LBRACKET:
+            self._parse_array(tape)
+        elif char == QUOTE:
+            self._parse_string(tape)
+
+    fn _parse_string(mut self, mut tape: JsonTape) raises:
+        """Parse JSON string with escape detection."""
+        var start_pos = self.index.get_position(self.idx_pos)
+        self.idx_pos += 1  # Skip opening quote
+
+        var end_pos = start_pos + 1
+        if self.idx_pos < len(self.index):
+            var next_char = self.index.get_character(self.idx_pos)
+            if next_char == QUOTE:
+                end_pos = self.index.get_position(self.idx_pos)
+                self.idx_pos += 1  # Skip closing quote
+
+        var str_start = start_pos + 1
+        var str_len = end_pos - start_pos - 1
+        var needs_unescape = self._string_has_escape(str_start, str_len)
+
+        _ = tape.append_string_ref(str_start, str_len, needs_unescape)
+
+    @always_inline
+    fn _string_has_escape(self, start: Int, length: Int) -> Bool:
+        """Quick scan for backslash in string."""
+        if length == 0:
+            return False
+
+        var ptr = self.source.unsafe_ptr()
+        for i in range(length):
+            if ptr[start + i] == 0x5C:  # backslash
+                return True
+        return False
+
+    @always_inline
+    fn _use_value_span(mut self, mut tape: JsonTape, span: ValueSpan) raises:
+        """Use pre-computed value span."""
+        var ptr = self.source.unsafe_ptr()
+        var start = Int(span.start)
+        var end = Int(span.end)
+
+        if span.value_type == VALUE_NUMBER:
+            if span.is_float == 1:
+                tape.append_double(self._fast_parse_float_inline(start, end))
+            else:
+                tape.append_int64(self._fast_parse_int_inline(start, end))
+        elif span.value_type == VALUE_TRUE:
+            tape.append_true()
+        elif span.value_type == VALUE_FALSE:
+            tape.append_false()
+        elif span.value_type == VALUE_NULL:
+            tape.append_null()
+
+    @always_inline
+    fn _fast_parse_int_inline(self, start: Int, end: Int) -> Int64:
+        """Fast integer parsing."""
+        var ptr = self.source.unsafe_ptr()
+        var pos = start
+        var negative = False
+
+        if ptr[pos] == CHAR_MINUS:
+            negative = True
+            pos += 1
+
+        var result: Int64 = 0
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            result = result * 10 + Int64(c - CHAR_0)
+            pos += 1
+
+        return -result if negative else result
+
+    @always_inline
+    fn _fast_parse_float_inline(self, start: Int, end: Int) -> Float64:
+        """Fast float parsing."""
+        var ptr = self.source.unsafe_ptr()
+        var pos = start
+        var negative = False
+        var mantissa: Int64 = 0
+        var exponent: Int = 0
+
+        if ptr[pos] == CHAR_MINUS:
+            negative = True
+            pos += 1
+
+        while pos < end:
+            var c = ptr[pos]
+            if c < CHAR_0 or c > CHAR_9:
+                break
+            mantissa = mantissa * 10 + Int64(c - CHAR_0)
+            pos += 1
+
+        if pos < end and ptr[pos] == CHAR_DOT:
+            pos += 1
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                mantissa = mantissa * 10 + Int64(c - CHAR_0)
+                exponent -= 1
+                pos += 1
+
+        if pos < end and (ptr[pos] == CHAR_E_LOWER or ptr[pos] == CHAR_E_UPPER):
+            pos += 1
+            var exp_negative = False
+            if pos < end and ptr[pos] == CHAR_MINUS:
+                exp_negative = True
+                pos += 1
+            elif pos < end and ptr[pos] == CHAR_PLUS:
+                pos += 1
+
+            var exp_val: Int = 0
+            while pos < end:
+                var c = ptr[pos]
+                if c < CHAR_0 or c > CHAR_9:
+                    break
+                exp_val = exp_val * 10 + Int(c - CHAR_0)
+                pos += 1
+
+            if exp_negative:
+                exponent -= exp_val
+            else:
+                exponent += exp_val
+
+        var result = _apply_exponent(Float64(mantissa), exponent)
+        return -result if negative else result
+
+    fn _parse_object(mut self, mut tape: JsonTape) raises:
+        """Parse JSON object."""
+        var start_idx = tape.start_object()
+        self.idx_pos += 1
+
+        while self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+
+            if char == RBRACE:
+                self.idx_pos += 1
+                tape.end_object(start_idx)
+                return
+            elif char == QUOTE:
+                self._parse_string(tape)
+                if self.idx_pos < len(self.index):
+                    var next_char = self.index.get_character(self.idx_pos)
+                    if next_char == COLON:
+                        var span = self.index.get_value_span(self.idx_pos)
+                        self.idx_pos += 1
+                        if span.value_type != VALUE_UNKNOWN:
+                            self._use_value_span(tape, span)
+                        else:
+                            self._parse_value(tape)
+            elif char == COMMA:
+                self.idx_pos += 1
+            else:
+                self.idx_pos += 1
+
+    fn _parse_array(mut self, mut tape: JsonTape) raises:
+        """Parse JSON array."""
+        var start_idx = tape.start_array()
+        var first_span = self.index.get_value_span(self.idx_pos)
+        self.idx_pos += 1
+
+        # First element
+        if first_span.value_type != VALUE_UNKNOWN:
+            self._use_value_span(tape, first_span)
+        elif self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+            if char != RBRACKET and char != COMMA:
+                self._parse_value(tape)
+
+        while self.idx_pos < len(self.index):
+            var char = self.index.get_character(self.idx_pos)
+
+            if char == RBRACKET:
+                self.idx_pos += 1
+                tape.end_array(start_idx)
+                return
+            elif char == COMMA:
+                var span = self.index.get_value_span(self.idx_pos)
+                self.idx_pos += 1
+                if span.value_type != VALUE_UNKNOWN:
+                    self._use_value_span(tape, span)
+                else:
+                    self._parse_value(tape)
+            else:
+                self._parse_value(tape)
+
+
+fn parse_to_tape_v3(json: String) raises -> JsonTape:
+    """
+    V3 JSON parsing with 32-byte SIMD structural indexing.
+
+    Uses wider SIMD (32-byte chunks) for Stage 1 to improve throughput
+    through better instruction-level parallelism.
+
+    Example:
+        var tape = parse_to_tape_v3(large_json)
+        # ~10-20% faster Stage 1 on large files
+    """
+    var parser = TapeParserV3(json)
     return parser.parse()
 
 

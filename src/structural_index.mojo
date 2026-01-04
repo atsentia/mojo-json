@@ -843,3 +843,165 @@ fn build_structural_index_parallel(
             result.append(positions_per_thread[i][j], chars_per_thread[i][j])
 
     return result^
+
+
+# =============================================================================
+# Wider SIMD: 32-byte (2x16) processing for better ILP
+# =============================================================================
+
+alias SIMD_WIDTH_2X: Int = 32
+
+
+@always_inline
+fn _create_structural_mask_32(chunk: SIMD[DType.uint8, SIMD_WIDTH_2X]) -> SIMD[DType.uint8, SIMD_WIDTH_2X]:
+    """Create structural mask for 32-byte chunk."""
+    var mask = SIMD[DType.uint8, SIMD_WIDTH_2X]()
+
+    @parameter
+    for i in range(SIMD_WIDTH_2X):
+        var c = chunk[i]
+        var is_struct = (c == QUOTE or c == COLON or c == COMMA or
+                        c == LBRACE or c == RBRACE or c == LBRACKET or c == RBRACKET)
+        mask[i] = 1 if is_struct else 0
+
+    return mask
+
+
+@always_inline
+fn _create_backslash_mask_32(chunk: SIMD[DType.uint8, SIMD_WIDTH_2X]) -> SIMD[DType.uint8, SIMD_WIDTH_2X]:
+    """Create backslash mask for 32-byte chunk."""
+    var mask = SIMD[DType.uint8, SIMD_WIDTH_2X]()
+
+    @parameter
+    for i in range(SIMD_WIDTH_2X):
+        mask[i] = 1 if chunk[i] == BACKSLASH else 0
+
+    return mask
+
+
+fn build_structural_index_v3(data: String) -> StructuralIndex:
+    """
+    V3 structural index builder with 32-byte (2x16) SIMD processing.
+
+    Improvements over V2:
+    - Processes 32 bytes per iteration for better instruction-level parallelism
+    - Reduces loop overhead by 2x
+    - Same value span detection as V2
+
+    Performance target: 800+ MB/s on Apple M3.
+    """
+    var n = len(data)
+    var index = StructuralIndex(capacity=n // 4)
+
+    var pos = 0
+    var in_string = False
+    var ptr = data.unsafe_ptr()
+
+    # 32-byte SIMD processing
+    while pos + SIMD_WIDTH_2X <= n:
+        # Load 32 bytes
+        var chunk = SIMD[DType.uint8, SIMD_WIDTH_2X]()
+
+        @parameter
+        for i in range(SIMD_WIDTH_2X):
+            chunk[i] = ptr[pos + i]
+
+        # Create masks for structural chars
+        var structural_mask = _create_structural_mask_32(chunk)
+        var backslash_mask = _create_backslash_mask_32(chunk)
+
+        # Quick check: any structural chars in this chunk?
+        var struct_count = structural_mask.reduce_add()
+
+        if struct_count == 0:
+            # No structural chars, skip entire chunk
+            pos += SIMD_WIDTH_2X
+            continue
+
+        # Process each byte in chunk
+        @parameter
+        for i in range(SIMD_WIDTH_2X):
+            var c = chunk[i]
+
+            if c == QUOTE:
+                # Check if this quote is escaped
+                var escaped = False
+                if i > 0:
+                    escaped = backslash_mask[i - 1] == 1
+                elif pos > 0:
+                    escaped = ptr[pos - 1] == BACKSLASH
+
+                if not escaped:
+                    in_string = not in_string
+                    index.append(pos + i, c)
+            elif not in_string and structural_mask[i] == 1:
+                # For : and , and [ scan for non-structural values
+                if c == COLON or c == COMMA:
+                    var value_span = _scan_value_after_delimiter(ptr, pos + i, n)
+                    index.append_with_value(pos + i, c, value_span)
+                elif c == LBRACKET:
+                    var value_span = _scan_value_after_delimiter(ptr, pos + i, n)
+                    index.append_with_value(pos + i, c, value_span)
+                else:
+                    index.append(pos + i, c)
+
+        pos += SIMD_WIDTH_2X
+
+    # 16-byte tail processing
+    while pos + SIMD_WIDTH <= n:
+        var chunk = SIMD[DType.uint8, SIMD_WIDTH]()
+
+        @parameter
+        for i in range(SIMD_WIDTH):
+            chunk[i] = ptr[pos + i]
+
+        var structural_mask = _create_structural_mask(chunk)
+        var backslash_mask = _create_backslash_mask(chunk)
+        var struct_count = structural_mask.reduce_add()
+
+        if struct_count == 0:
+            pos += SIMD_WIDTH
+            continue
+
+        @parameter
+        for i in range(SIMD_WIDTH):
+            var c = chunk[i]
+
+            if c == QUOTE:
+                var escaped = False
+                if i > 0:
+                    escaped = backslash_mask[i - 1] == 1
+                elif pos > 0:
+                    escaped = ptr[pos - 1] == BACKSLASH
+
+                if not escaped:
+                    in_string = not in_string
+                    index.append(pos + i, c)
+            elif not in_string and structural_mask[i] == 1:
+                if c == COLON or c == COMMA or c == LBRACKET:
+                    var value_span = _scan_value_after_delimiter(ptr, pos + i, n)
+                    index.append_with_value(pos + i, c, value_span)
+                else:
+                    index.append(pos + i, c)
+
+        pos += SIMD_WIDTH
+
+    # Scalar tail
+    while pos < n:
+        var c = ptr[pos]
+
+        if c == QUOTE:
+            var escaped = pos > 0 and ptr[pos - 1] == BACKSLASH
+            if not escaped:
+                in_string = not in_string
+                index.append(pos, c)
+        elif not in_string and _is_structural(c):
+            if c == COLON or c == COMMA or c == LBRACKET:
+                var value_span = _scan_value_after_delimiter(ptr, pos, n)
+                index.append_with_value(pos, c, value_span)
+            else:
+                index.append(pos, c)
+
+        pos += 1
+
+    return index^

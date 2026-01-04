@@ -14,6 +14,7 @@ from pathlib import Path
 from src.tape_parser import (
     parse_to_tape,
     parse_to_tape_v2,
+    parse_to_tape_v3,
     parse_to_tape_parallel,
     parse_to_tape_compressed,
     TAPE_STRING,
@@ -79,7 +80,7 @@ fn benchmark_file(name: String, path: String, iterations: Int) raises:
     var tape_v1_throughput = Float64(len(json)) * Float64(iterations) / Float64(tape_v1_time) * 1000.0
     print("    Tape V1:       ", Int(tape_v1_throughput), "MB/s")
 
-    # Tape V2 (baseline)
+    # Tape V2 (16-byte SIMD)
     var tape_v2_start = perf_counter_ns()
     for _ in range(iterations):
         var tape = parse_to_tape_v2(json)
@@ -88,6 +89,16 @@ fn benchmark_file(name: String, path: String, iterations: Int) raises:
     var tape_v2_throughput = Float64(len(json)) * Float64(iterations) / Float64(tape_v2_time) * 1000.0
     var v1_vs_v2 = tape_v1_throughput / tape_v2_throughput
     print("    Tape V2:       ", Int(tape_v2_throughput), "MB/s (V1 is", Int(v1_vs_v2 * 100), "% of V2)")
+
+    # Tape V3 (32-byte SIMD)
+    var tape_v3_start = perf_counter_ns()
+    for _ in range(iterations):
+        var tape = parse_to_tape_v3(json)
+        _ = len(tape.entries)
+    var tape_v3_time = perf_counter_ns() - tape_v3_start
+    var tape_v3_throughput = Float64(len(json)) * Float64(iterations) / Float64(tape_v3_time) * 1000.0
+    var v3_vs_v2 = tape_v3_throughput / tape_v2_throughput
+    print("    Tape V3:       ", Int(tape_v3_throughput), "MB/s (", Int(v3_vs_v2 * 100), "% of V2)")
 
     # Parallel (for comparison)
     var parallel_start = perf_counter_ns()
