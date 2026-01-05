@@ -176,3 +176,148 @@ fn is_metal_available() -> Bool:
         return check_fn() != 0
     except:
         return False
+
+
+# =============================================================================
+# GpJSON Full Stage 1 Pipeline
+# =============================================================================
+
+# Function type aliases for GpJSON C bridge
+alias HasGpjsonFnType = fn (Int) -> Int32  # (ctx) -> int
+alias FullStage1FnType = fn (Int, Int, UInt32, Int, Int, Int) -> Int32
+
+
+struct GpJsonStage1Result(Sized):
+    """Result from full GPU Stage 1 pipeline."""
+
+    var positions: List[UInt32]
+    var chars: List[UInt8]
+
+    fn __init__(out self):
+        self.positions = List[UInt32]()
+        self.chars = List[UInt8]()
+
+    fn __moveinit__(out self, deinit existing: Self):
+        self.positions = existing.positions^
+        self.chars = existing.chars^
+
+    fn __len__(self) -> Int:
+        return len(self.positions)
+
+
+struct MetalGpJsonPipeline:
+    """
+    Full GPU Stage 1 pipeline using GpJSON-inspired algorithms.
+
+    Implements:
+    1. Quote bitmap creation (64 bytes → 1 uint64)
+    2. Prefix-XOR string mask (simdjson algorithm)
+    3. Structural character extraction with string filtering
+    """
+
+    var _lib: OwnedDLHandle
+    var _handle: Int
+
+    fn __init__(out self, lib_path: String = DEFAULT_LIB_PATH) raises:
+        """Initialize GpJSON pipeline."""
+        var dylib_path = lib_path + "/libmetal_bridge.dylib"
+        self._lib = OwnedDLHandle(dylib_path)
+        self._handle = 0
+
+        var init_fn = self._lib.get_function[InitFnType]("metal_json_init")
+        var metallib_path = lib_path + "/json_classify.metallib"
+        var path_ptr = metallib_path.unsafe_cstr_ptr()
+        var handle = init_fn(Int(path_ptr))
+
+        if handle == 0:
+            raise Error("Failed to initialize Metal context")
+
+        self._handle = handle
+
+        # Check if GpJSON kernels are available
+        var has_gpjson = self._lib.get_function[HasGpjsonFnType]("metal_json_has_gpjson_pipeline")
+        if has_gpjson(self._handle) == 0:
+            raise Error("GpJSON kernels not available in metallib")
+
+    fn __del__(deinit self):
+        if self._handle != 0:
+            var free_fn = self._lib.get_function[FreeFnType]("metal_json_free")
+            free_fn(self._handle)
+
+    fn run_stage1(self, data: String) raises -> GpJsonStage1Result:
+        """
+        Run full GPU Stage 1: quote bitmap → string mask → structural extraction.
+
+        Args:
+            data: Input JSON string
+
+        Returns:
+            GpJsonStage1Result with positions and characters of structural tokens
+        """
+        var n = len(data)
+        if n == 0:
+            return GpJsonStage1Result()
+
+        # Allocate output buffers (worst case: every byte is structural)
+        var positions = List[UInt32](capacity=n)
+        positions.resize(n, 0)
+        var chars = List[UInt8](capacity=n)
+        chars.resize(n, 0)
+        var count = List[UInt32](capacity=1)
+        count.resize(1, 0)
+
+        var stage1_fn = self._lib.get_function[FullStage1FnType]("metal_json_full_stage1")
+
+        var status = stage1_fn(
+            self._handle,
+            Int(data.unsafe_ptr()),
+            UInt32(n),
+            Int(positions.unsafe_ptr()),
+            Int(chars.unsafe_ptr()),
+            Int(count.unsafe_ptr()),
+        )
+
+        if status != 0:
+            raise Error("Metal GPU Stage 1 failed")
+
+        # Trim to actual count
+        var actual_count = Int(count[0])
+        var result = GpJsonStage1Result()
+        result.positions = List[UInt32](capacity=actual_count)
+        result.chars = List[UInt8](capacity=actual_count)
+
+        for i in range(actual_count):
+            result.positions.append(positions[i])
+            result.chars.append(chars[i])
+
+        return result^
+
+
+fn has_gpjson_pipeline() -> Bool:
+    """Check if GpJSON GPU pipeline is available."""
+    try:
+        var lib = OwnedDLHandle(DEFAULT_LIB_PATH + "/libmetal_bridge.dylib")
+
+        # First check Metal is available
+        var check_fn = lib.get_function[IsAvailableFnType]("metal_json_is_available")
+        if check_fn() == 0:
+            return False
+
+        # Initialize context to check for GpJSON kernels
+        var init_fn = lib.get_function[InitFnType]("metal_json_init")
+        var metallib_path = DEFAULT_LIB_PATH + "/json_classify.metallib"
+        var path_ptr = metallib_path.unsafe_cstr_ptr()
+        var handle = init_fn(Int(path_ptr))
+
+        if handle == 0:
+            return False
+
+        var has_gpjson = lib.get_function[HasGpjsonFnType]("metal_json_has_gpjson_pipeline")
+        var result = has_gpjson(handle) != 0
+
+        var free_fn = lib.get_function[FreeFnType]("metal_json_free")
+        free_fn(handle)
+
+        return result
+    except:
+        return False
