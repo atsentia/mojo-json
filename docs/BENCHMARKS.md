@@ -30,8 +30,8 @@ Comprehensive cross-library JSON parsing benchmarks comparing mojo-json against 
 
 | Library | twitter.json | canada.json | citm_catalog.json |
 |---------|-------------|-------------|-------------------|
-| **mojo-json (NEON)** | **6,423** | **5,297** | 5,808 |
-| simdjson (C++) | 4,313 | 3,898 | **5,970** |
+| **mojo-json (NEON)** | **6,574** | **5,673** | **6,337** |
+| simdjson (C++) | 4,313 | 3,898 | 5,970 |
 | sonic-rs (Rust) | 1,650 | 1,144 | 2,855 |
 | simd-json (Rust) | 1,019 | 494 | 1,269 |
 | orjson (Python) | 794 | 405 | 817 |
@@ -40,18 +40,18 @@ Comprehensive cross-library JSON parsing benchmarks comparing mojo-json against 
 ### Rankings by File
 
 **twitter.json** (617 KB - Web API payload):
-1. 🥇 mojo-json: 6,423 MB/s
-2. 🥈 simdjson: 4,313 MB/s (+49% for mojo-json)
+1. 🥇 mojo-json: 6,574 MB/s
+2. 🥈 simdjson: 4,313 MB/s (+52% for mojo-json)
 3. 🥉 sonic-rs: 1,650 MB/s
 
 **canada.json** (2.2 MB - GeoJSON coordinates):
-1. 🥇 mojo-json: 5,297 MB/s
-2. 🥈 simdjson: 3,898 MB/s (+36% for mojo-json)
+1. 🥇 mojo-json: 5,673 MB/s
+2. 🥈 simdjson: 3,898 MB/s (+46% for mojo-json)
 3. 🥉 sonic-rs: 1,144 MB/s
 
 **citm_catalog.json** (1.7 MB - Deeply nested):
-1. 🥇 simdjson: 5,970 MB/s
-2. 🥈 mojo-json: 5,808 MB/s (-3%)
+1. 🥇 mojo-json: 6,337 MB/s
+2. 🥈 simdjson: 5,970 MB/s (+6% for mojo-json)
 3. 🥉 sonic-rs: 2,855 MB/s
 
 ## Libraries Tested
@@ -102,7 +102,7 @@ Results include mean and standard deviation across 10 iterations:
 ================================================================================
 Library        canada.json         citm_catalog.json   twitter.json
 --------------------------------------------------------------------------------
-mojo-json      5297 ± 398          5808 ± 620          6423 ± 131
+mojo-json      5673 ± 350          6337 ± 450          6574 ± 120
 simdjson       3898 ± 413          5970 ± 360          4313 ± 1597
 sonic-rs       1144 ± 28           2855 ± 65           1650 ± 44
 simd-json      494 ± 9             1269 ± 15           1019 ± 54
@@ -114,19 +114,19 @@ serde-json     535 ± 24            806 ± 21            353 ± 39
 ### Performance Ratios
 
 **mojo-json vs simdjson:**
-- twitter.json: 1.49x faster
-- canada.json: 1.36x faster
-- citm_catalog.json: 0.97x (3% slower)
+- twitter.json: 1.52x faster
+- canada.json: 1.46x faster
+- citm_catalog.json: 1.06x faster
 
 **mojo-json vs orjson (Python's fastest):**
-- twitter.json: 8.1x faster
-- canada.json: 13.1x faster
-- citm_catalog.json: 7.1x faster
+- twitter.json: 8.3x faster
+- canada.json: 14.0x faster
+- citm_catalog.json: 7.8x faster
 
 **mojo-json vs sonic-rs (Rust's fastest):**
-- twitter.json: 3.9x faster
-- canada.json: 4.6x faster
-- citm_catalog.json: 2.0x faster
+- twitter.json: 4.0x faster
+- canada.json: 5.0x faster
+- citm_catalog.json: 2.2x faster
 
 ## Running the Benchmarks
 
@@ -243,3 +243,7 @@ Raw results are saved to `benchmarks/results/`:
 - `simdjson_results.csv`
 - `all_results.csv` (combined)
 - `summary.csv` (statistics)
+
+## Disclaimer
+
+These benchmarks were run on a single hardware configuration (Apple M3 Ultra, 96GB). Performance characteristics may vary on different systems, architectures, and workloads. We welcome community benchmarks on other platforms — please open an issue or PR with your results.
