@@ -762,3 +762,109 @@ int metal_json_has_gpjson_pipeline(MetalContext* ctx) {
             ctx->pipeline_string_mask &&
             ctx->pipeline_extract_structural) ? 1 : 0;
 }
+
+// =============================================================================
+// Fused Kernel (Single-Pass Structural Extraction)
+// =============================================================================
+
+/**
+ * Fused single-pass structural extraction.
+ *
+ * Combines quote bitmap + prefix-XOR + extraction into ONE kernel dispatch.
+ * Eliminates 2 kernel dispatches and 2 memory round-trips.
+ *
+ * @param ctx Context
+ * @param input Input JSON bytes
+ * @param size Input size
+ * @param output_pos Output: structural positions
+ * @param output_chars Output: structural characters
+ * @param output_count Output: number found
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_fused_extract(MetalContext* ctx,
+                             const uint8_t* input,
+                             uint32_t size,
+                             uint32_t* output_pos,
+                             uint8_t* output_chars,
+                             uint32_t* output_count) {
+    @autoreleasepool {
+        if (!ctx || !input || size == 0) {
+            return -1;
+        }
+
+        // Get fused pipeline (create on first use)
+        static id<MTLComputePipelineState> fused_pipeline = nil;
+        if (!fused_pipeline) {
+            NSError* error = nil;
+            id<MTLFunction> func = [ctx->library newFunctionWithName:@"fused_structural_extract"];
+            if (!func) {
+                fprintf(stderr, "metal_json_fused_extract: Fused kernel not found\n");
+                return -1;
+            }
+            fused_pipeline = [ctx->device newComputePipelineStateWithFunction:func error:&error];
+            if (!fused_pipeline) {
+                fprintf(stderr, "metal_json_fused_extract: Failed to create pipeline: %s\n",
+                        error.localizedDescription.UTF8String);
+                return -1;
+            }
+        }
+
+        ensure_buffers(ctx, size);
+        ensure_gpjson_buffers(ctx, size);
+
+        uint32_t num_chunks = (size + 63) / 64;
+
+        // Copy input
+        memcpy(ctx->input_buffer.contents, input, size);
+
+        // Reset atomic counter
+        uint32_t zero = 0;
+        memcpy(ctx->atomic_counter_buffer.contents, &zero, sizeof(zero));
+
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:fused_pipeline];
+        [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:ctx->structural_pos_buffer offset:0 atIndex:1];
+        [encoder setBuffer:ctx->structural_char_buffer offset:0 atIndex:2];
+        [encoder setBuffer:ctx->atomic_counter_buffer offset:0 atIndex:3];
+        [encoder setBuffer:ctx->quote_carry_buffer offset:0 atIndex:4];  // Reuse for carry
+        [encoder setBytes:&size length:sizeof(size) atIndex:5];
+
+        // Each thread processes 64 bytes (one chunk)
+        NSUInteger threadsPerGroup = MIN(fused_pipeline.maxTotalThreadsPerThreadgroup, num_chunks);
+        NSUInteger numGroups = (num_chunks + threadsPerGroup - 1) / threadsPerGroup;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            fprintf(stderr, "metal_json_fused_extract: GPU execution failed: %s\n",
+                    commandBuffer.error.localizedDescription.UTF8String);
+            return -1;
+        }
+
+        // Copy results
+        memcpy(output_count, ctx->atomic_counter_buffer.contents, sizeof(uint32_t));
+        if (*output_count > 0) {
+            memcpy(output_pos, ctx->structural_pos_buffer.contents, *output_count * sizeof(uint32_t));
+            memcpy(output_chars, ctx->structural_char_buffer.contents, *output_count);
+        }
+
+        return 0;
+    }
+}
+
+/**
+ * Check if fused kernel is available.
+ */
+int metal_json_has_fused_kernel(MetalContext* ctx) {
+    if (!ctx || !ctx->library) return 0;
+    id<MTLFunction> func = [ctx->library newFunctionWithName:@"fused_structural_extract"];
+    return func != nil;
+}

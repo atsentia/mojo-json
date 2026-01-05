@@ -321,3 +321,91 @@ fn has_gpjson_pipeline() -> Bool:
         return result
     except:
         return False
+
+
+# =============================================================================
+# Fused Kernel (Single-Pass) - Kernel Fusion Optimization
+# =============================================================================
+
+alias FusedExtractFnType = fn (Int, Int, UInt32, Int, Int, Int) -> Int32
+
+
+struct MetalFusedPipeline:
+    """
+    Fused single-pass GPU structural extraction.
+
+    Combines quote bitmap + prefix-XOR + extraction into ONE kernel.
+    Eliminates 2 kernel dispatches and memory round-trips.
+    """
+
+    var _lib: OwnedDLHandle
+    var _handle: Int
+
+    fn __init__(out self, lib_path: String = DEFAULT_LIB_PATH) raises:
+        """Initialize fused pipeline."""
+        var dylib_path = lib_path + "/libmetal_bridge.dylib"
+        self._lib = OwnedDLHandle(dylib_path)
+        self._handle = 0
+
+        var init_fn = self._lib.get_function[InitFnType]("metal_json_init")
+        var metallib_path = lib_path + "/json_classify.metallib"
+        var path_ptr = metallib_path.unsafe_cstr_ptr()
+        var handle = init_fn(Int(path_ptr))
+
+        if handle == 0:
+            raise Error("Failed to initialize Metal context")
+
+        self._handle = handle
+
+    fn __del__(deinit self):
+        if self._handle != 0:
+            var free_fn = self._lib.get_function[FreeFnType]("metal_json_free")
+            free_fn(self._handle)
+
+    fn extract(self, data: String) raises -> GpJsonStage1Result:
+        """
+        Run fused single-pass structural extraction.
+
+        Args:
+            data: Input JSON string
+
+        Returns:
+            GpJsonStage1Result with structural positions and characters
+        """
+        var n = len(data)
+        if n == 0:
+            return GpJsonStage1Result()
+
+        # Allocate output buffers
+        var positions = List[UInt32](capacity=n)
+        positions.resize(n, 0)
+        var chars = List[UInt8](capacity=n)
+        chars.resize(n, 0)
+        var count = List[UInt32](capacity=1)
+        count.resize(1, 0)
+
+        var fused_fn = self._lib.get_function[FusedExtractFnType]("metal_json_fused_extract")
+
+        var status = fused_fn(
+            self._handle,
+            Int(data.unsafe_ptr()),
+            UInt32(n),
+            Int(positions.unsafe_ptr()),
+            Int(chars.unsafe_ptr()),
+            Int(count.unsafe_ptr()),
+        )
+
+        if status != 0:
+            raise Error("Fused GPU extraction failed")
+
+        # Trim to actual count
+        var actual_count = Int(count[0])
+        var result = GpJsonStage1Result()
+        result.positions = List[UInt32](capacity=actual_count)
+        result.chars = List[UInt8](capacity=actual_count)
+
+        for i in range(actual_count):
+            result.positions.append(positions[i])
+            result.chars.append(chars[i])
+
+        return result^
