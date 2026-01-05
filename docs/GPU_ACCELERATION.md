@@ -279,12 +279,35 @@ New kernels in `metal/json_classify.metal`:
 ### Build Requirements
 
 ```bash
-# Install Metal toolchain first
+# 1. Install Metal toolchain first (one-time)
 xcodebuild -downloadComponent MetalToolchain
 
-# Then rebuild
-cd metal && ./build_all.sh
+# 2. Compile Metal shaders to .metallib
+cd metal
+xcrun metal -c json_classify.metal -o json_classify.air
+xcrun metallib json_classify.air -o json_classify.metallib
+
+# 3. Build C bridge library (already done)
+clang -shared -fobjc-arc metal_bridge.m -o libmetal_bridge.dylib \
+    -framework Metal -framework Foundation
 ```
+
+### C API Functions (metal_bridge.h)
+
+The C bridge exposes both simple character classification and full GpJSON pipeline:
+
+**Simple Classification (working now)**:
+- `metal_json_init()` - Initialize Metal context
+- `metal_json_classify()` - GPU character classification at 2.5 GB/s
+- `metal_json_free()` - Cleanup
+
+**Full GpJSON Pipeline (requires metallib rebuild)**:
+- `metal_json_has_gpjson_pipeline()` - Check if GpJSON kernels available
+- `metal_json_create_quote_bitmap()` - 64-bit quote bitmaps
+- `metal_json_create_string_mask()` - Prefix-XOR transformation
+- `metal_json_extract_structural()` - Filter by string mask
+- `metal_json_find_newlines()` - NDJSON line detection
+- `metal_json_full_stage1()` - Combined 3-pass pipeline
 
 ### Expected Performance (when compiled)
 

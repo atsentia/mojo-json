@@ -29,10 +29,24 @@ typedef struct MetalContext {
     id<MTLComputePipelineState> pipeline_lookup;
     id<MTLComputePipelineState> pipeline_lookup_vec8;
 
+    // GpJSON-inspired pipelines (full Stage 1)
+    id<MTLComputePipelineState> pipeline_quote_bitmap;
+    id<MTLComputePipelineState> pipeline_string_mask;
+    id<MTLComputePipelineState> pipeline_extract_structural;
+    id<MTLComputePipelineState> pipeline_find_newlines;
+
     // Reusable buffers (for repeated calls with same size)
     id<MTLBuffer> input_buffer;
     id<MTLBuffer> output_buffer;
     uint32_t buffer_size;
+
+    // GpJSON buffers for full pipeline
+    id<MTLBuffer> quote_bits_buffer;      // 64-bit quote bitmaps
+    id<MTLBuffer> quote_carry_buffer;     // Quote parity for carry
+    id<MTLBuffer> structural_pos_buffer;  // Output positions
+    id<MTLBuffer> structural_char_buffer; // Output characters
+    id<MTLBuffer> atomic_counter_buffer;  // Atomic counter
+    uint32_t gpjson_buffer_size;
 } MetalContext;
 
 /**
@@ -120,6 +134,27 @@ MetalContext* metal_json_init(const char* metallib_path) {
             fprintf(stderr, "metal_json_init: No pipelines created\n");
             free(ctx);
             return NULL;
+        }
+
+        // Create GpJSON-inspired pipelines (optional - for full Stage 1)
+        func = [ctx->library newFunctionWithName:@"create_quote_bitmap"];
+        if (func) {
+            ctx->pipeline_quote_bitmap = [ctx->device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [ctx->library newFunctionWithName:@"create_string_mask"];
+        if (func) {
+            ctx->pipeline_string_mask = [ctx->device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [ctx->library newFunctionWithName:@"extract_structural_positions"];
+        if (func) {
+            ctx->pipeline_extract_structural = [ctx->device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [ctx->library newFunctionWithName:@"find_newlines"];
+        if (func) {
+            ctx->pipeline_find_newlines = [ctx->device newComputePipelineStateWithFunction:func error:&error];
         }
 
         return ctx;
@@ -330,4 +365,400 @@ int metal_json_is_available(void) {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         return device != nil;
     }
+}
+
+// =============================================================================
+// GpJSON-Inspired Full Stage 1 Pipeline
+// =============================================================================
+
+/**
+ * Ensure GpJSON buffers are allocated for given input size.
+ */
+static void ensure_gpjson_buffers(MetalContext* ctx, uint32_t size) {
+    if (ctx->gpjson_buffer_size >= size) {
+        return;
+    }
+
+    // Round up to 64KB
+    uint32_t alloc_size = ((size + 65535) / 65536) * 65536;
+    uint32_t num_chunks = (size + 63) / 64;
+
+    // 64-bit quote bitmaps (one uint64 per 64 bytes)
+    ctx->quote_bits_buffer = [ctx->device newBufferWithLength:num_chunks * sizeof(uint64_t)
+                                                      options:MTLResourceStorageModeShared];
+
+    // Quote parity carry (one byte per chunk)
+    ctx->quote_carry_buffer = [ctx->device newBufferWithLength:num_chunks
+                                                       options:MTLResourceStorageModeShared];
+
+    // Structural positions output (worst case: every byte is structural)
+    ctx->structural_pos_buffer = [ctx->device newBufferWithLength:alloc_size * sizeof(uint32_t)
+                                                          options:MTLResourceStorageModeShared];
+
+    // Structural chars output
+    ctx->structural_char_buffer = [ctx->device newBufferWithLength:alloc_size
+                                                           options:MTLResourceStorageModeShared];
+
+    // Atomic counter
+    ctx->atomic_counter_buffer = [ctx->device newBufferWithLength:sizeof(uint32_t)
+                                                          options:MTLResourceStorageModeShared];
+
+    ctx->gpjson_buffer_size = alloc_size;
+}
+
+/**
+ * Create quote bitmap - marks quote positions in 64-bit bitmaps.
+ * Each thread processes 64 bytes into one uint64.
+ *
+ * @param ctx Context
+ * @param input Input JSON bytes
+ * @param size Input size
+ * @param quote_bits Output: 64-bit quote bitmaps (caller allocates num_chunks uint64s)
+ * @param quote_carry Output: Quote parity per chunk (caller allocates num_chunks bytes)
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_create_quote_bitmap(MetalContext* ctx,
+                                   const uint8_t* input,
+                                   uint32_t size,
+                                   uint64_t* quote_bits,
+                                   uint8_t* quote_carry) {
+    @autoreleasepool {
+        if (!ctx || !ctx->pipeline_quote_bitmap || !input || size == 0) {
+            return -1;
+        }
+
+        ensure_buffers(ctx, size);
+        ensure_gpjson_buffers(ctx, size);
+
+        uint32_t num_chunks = (size + 63) / 64;
+
+        memcpy(ctx->input_buffer.contents, input, size);
+
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline_quote_bitmap];
+        [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:1];
+        [encoder setBuffer:ctx->quote_carry_buffer offset:0 atIndex:2];
+        [encoder setBytes:&size length:sizeof(size) atIndex:3];
+
+        NSUInteger threadsPerGroup = MIN(ctx->pipeline_quote_bitmap.maxTotalThreadsPerThreadgroup, num_chunks);
+        NSUInteger numGroups = (num_chunks + threadsPerGroup - 1) / threadsPerGroup;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            return -1;
+        }
+
+        memcpy(quote_bits, ctx->quote_bits_buffer.contents, num_chunks * sizeof(uint64_t));
+        memcpy(quote_carry, ctx->quote_carry_buffer.contents, num_chunks);
+
+        return 0;
+    }
+}
+
+/**
+ * Create string mask using prefix-XOR.
+ * Converts quote bitmaps to in-string masks (bit=1 means inside string).
+ *
+ * @param ctx Context
+ * @param quote_bits In/Out: Quote bitmaps -> String masks
+ * @param quote_carry Quote parity from create_quote_bitmap
+ * @param num_chunks Number of 64-byte chunks
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_create_string_mask(MetalContext* ctx,
+                                  uint64_t* quote_bits,
+                                  const uint8_t* quote_carry,
+                                  uint32_t num_chunks) {
+    @autoreleasepool {
+        if (!ctx || !ctx->pipeline_string_mask || num_chunks == 0) {
+            return -1;
+        }
+
+        memcpy(ctx->quote_bits_buffer.contents, quote_bits, num_chunks * sizeof(uint64_t));
+        memcpy(ctx->quote_carry_buffer.contents, quote_carry, num_chunks);
+
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline_string_mask];
+        [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:0];
+        [encoder setBuffer:ctx->quote_carry_buffer offset:0 atIndex:1];
+        [encoder setBytes:&num_chunks length:sizeof(num_chunks) atIndex:2];
+
+        NSUInteger threadsPerGroup = MIN(ctx->pipeline_string_mask.maxTotalThreadsPerThreadgroup, num_chunks);
+        NSUInteger numGroups = (num_chunks + threadsPerGroup - 1) / threadsPerGroup;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            return -1;
+        }
+
+        memcpy(quote_bits, ctx->quote_bits_buffer.contents, num_chunks * sizeof(uint64_t));
+
+        return 0;
+    }
+}
+
+/**
+ * Extract structural character positions, filtering out those inside strings.
+ *
+ * @param ctx Context
+ * @param input Input JSON bytes
+ * @param string_mask In-string masks from create_string_mask
+ * @param size Input size
+ * @param output_pos Output: Positions of structural characters
+ * @param output_chars Output: The structural characters themselves
+ * @param output_count Output: Number of structural characters found
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_extract_structural(MetalContext* ctx,
+                                  const uint8_t* input,
+                                  const uint64_t* string_mask,
+                                  uint32_t size,
+                                  uint32_t* output_pos,
+                                  uint8_t* output_chars,
+                                  uint32_t* output_count) {
+    @autoreleasepool {
+        if (!ctx || !ctx->pipeline_extract_structural || !input || size == 0) {
+            return -1;
+        }
+
+        ensure_buffers(ctx, size);
+        ensure_gpjson_buffers(ctx, size);
+
+        uint32_t num_chunks = (size + 63) / 64;
+
+        memcpy(ctx->input_buffer.contents, input, size);
+        memcpy(ctx->quote_bits_buffer.contents, string_mask, num_chunks * sizeof(uint64_t));
+
+        // Reset atomic counter
+        uint32_t zero = 0;
+        memcpy(ctx->atomic_counter_buffer.contents, &zero, sizeof(zero));
+
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline_extract_structural];
+        [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:1];
+        [encoder setBuffer:ctx->structural_pos_buffer offset:0 atIndex:2];
+        [encoder setBuffer:ctx->structural_char_buffer offset:0 atIndex:3];
+        [encoder setBuffer:ctx->atomic_counter_buffer offset:0 atIndex:4];
+        [encoder setBytes:&size length:sizeof(size) atIndex:5];
+
+        NSUInteger threadsPerGroup = MIN(ctx->pipeline_extract_structural.maxTotalThreadsPerThreadgroup, (NSUInteger)size);
+        NSUInteger numGroups = (size + threadsPerGroup - 1) / threadsPerGroup;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            return -1;
+        }
+
+        memcpy(output_count, ctx->atomic_counter_buffer.contents, sizeof(uint32_t));
+        if (*output_count > 0) {
+            memcpy(output_pos, ctx->structural_pos_buffer.contents, *output_count * sizeof(uint32_t));
+            memcpy(output_chars, ctx->structural_char_buffer.contents, *output_count);
+        }
+
+        return 0;
+    }
+}
+
+/**
+ * Find newline positions for NDJSON processing.
+ *
+ * @param ctx Context
+ * @param input Input bytes
+ * @param size Input size
+ * @param newline_bits Output: 64-bit newline bitmaps (one uint64 per 64 bytes)
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_find_newlines(MetalContext* ctx,
+                             const uint8_t* input,
+                             uint32_t size,
+                             uint64_t* newline_bits) {
+    @autoreleasepool {
+        if (!ctx || !ctx->pipeline_find_newlines || !input || size == 0) {
+            return -1;
+        }
+
+        ensure_buffers(ctx, size);
+        ensure_gpjson_buffers(ctx, size);
+
+        uint32_t num_chunks = (size + 63) / 64;
+
+        memcpy(ctx->input_buffer.contents, input, size);
+
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline_find_newlines];
+        [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:1];  // Reuse for newlines
+        [encoder setBytes:&size length:sizeof(size) atIndex:2];
+
+        NSUInteger threadsPerGroup = MIN(ctx->pipeline_find_newlines.maxTotalThreadsPerThreadgroup, num_chunks);
+        NSUInteger numGroups = (num_chunks + threadsPerGroup - 1) / threadsPerGroup;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            return -1;
+        }
+
+        memcpy(newline_bits, ctx->quote_bits_buffer.contents, num_chunks * sizeof(uint64_t));
+
+        return 0;
+    }
+}
+
+/**
+ * Full GPU Stage 1: Run the complete GpJSON pipeline.
+ *
+ * This combines:
+ * 1. create_quote_bitmap - Find quote positions
+ * 2. create_string_mask - Prefix-XOR to mark string regions
+ * 3. extract_structural_positions - Get structural chars outside strings
+ *
+ * @param ctx Context
+ * @param input Input JSON bytes
+ * @param size Input size
+ * @param output_pos Output: Positions of structural characters
+ * @param output_chars Output: The structural characters
+ * @param output_count Output: Number found
+ * @return 0 on success, -1 on failure
+ */
+int metal_json_full_stage1(MetalContext* ctx,
+                           const uint8_t* input,
+                           uint32_t size,
+                           uint32_t* output_pos,
+                           uint8_t* output_chars,
+                           uint32_t* output_count) {
+    @autoreleasepool {
+        if (!ctx || !input || size == 0) {
+            return -1;
+        }
+
+        // Check all required pipelines are available
+        if (!ctx->pipeline_quote_bitmap ||
+            !ctx->pipeline_string_mask ||
+            !ctx->pipeline_extract_structural) {
+            return -1;
+        }
+
+        ensure_buffers(ctx, size);
+        ensure_gpjson_buffers(ctx, size);
+
+        uint32_t num_chunks = (size + 63) / 64;
+
+        // Copy input once
+        memcpy(ctx->input_buffer.contents, input, size);
+
+        // Create command buffer for all passes
+        id<MTLCommandBuffer> commandBuffer = [ctx->queue commandBuffer];
+
+        // Pass 1: Create quote bitmap
+        {
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:ctx->pipeline_quote_bitmap];
+            [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+            [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:1];
+            [encoder setBuffer:ctx->quote_carry_buffer offset:0 atIndex:2];
+            [encoder setBytes:&size length:sizeof(size) atIndex:3];
+
+            NSUInteger tpg = MIN(ctx->pipeline_quote_bitmap.maxTotalThreadsPerThreadgroup, num_chunks);
+            [encoder dispatchThreadgroups:MTLSizeMake((num_chunks + tpg - 1) / tpg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        // Pass 2: Create string mask (depends on pass 1)
+        {
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:ctx->pipeline_string_mask];
+            [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:0];
+            [encoder setBuffer:ctx->quote_carry_buffer offset:0 atIndex:1];
+            [encoder setBytes:&num_chunks length:sizeof(num_chunks) atIndex:2];
+
+            NSUInteger tpg = MIN(ctx->pipeline_string_mask.maxTotalThreadsPerThreadgroup, num_chunks);
+            [encoder dispatchThreadgroups:MTLSizeMake((num_chunks + tpg - 1) / tpg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        // Pass 3: Extract structural positions (depends on pass 2)
+        {
+            // Reset atomic counter
+            uint32_t zero = 0;
+            memcpy(ctx->atomic_counter_buffer.contents, &zero, sizeof(zero));
+
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:ctx->pipeline_extract_structural];
+            [encoder setBuffer:ctx->input_buffer offset:0 atIndex:0];
+            [encoder setBuffer:ctx->quote_bits_buffer offset:0 atIndex:1];
+            [encoder setBuffer:ctx->structural_pos_buffer offset:0 atIndex:2];
+            [encoder setBuffer:ctx->structural_char_buffer offset:0 atIndex:3];
+            [encoder setBuffer:ctx->atomic_counter_buffer offset:0 atIndex:4];
+            [encoder setBytes:&size length:sizeof(size) atIndex:5];
+
+            NSUInteger tpg = MIN(ctx->pipeline_extract_structural.maxTotalThreadsPerThreadgroup, (NSUInteger)size);
+            [encoder dispatchThreadgroups:MTLSizeMake((size + tpg - 1) / tpg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            fprintf(stderr, "metal_json_full_stage1: GPU execution failed: %s\n",
+                    commandBuffer.error.localizedDescription.UTF8String);
+            return -1;
+        }
+
+        // Copy results back
+        memcpy(output_count, ctx->atomic_counter_buffer.contents, sizeof(uint32_t));
+        if (*output_count > 0) {
+            memcpy(output_pos, ctx->structural_pos_buffer.contents, *output_count * sizeof(uint32_t));
+            memcpy(output_chars, ctx->structural_char_buffer.contents, *output_count);
+        }
+
+        return 0;
+    }
+}
+
+/**
+ * Check if GpJSON pipeline is available.
+ */
+int metal_json_has_gpjson_pipeline(MetalContext* ctx) {
+    if (!ctx) return 0;
+    return (ctx->pipeline_quote_bitmap &&
+            ctx->pipeline_string_mask &&
+            ctx->pipeline_extract_structural) ? 1 : 0;
 }
