@@ -178,3 +178,165 @@ constant uint8_t CHAR_LOOKUP[256] = {
         }
     }
 }
+
+
+// =============================================================================
+// GpJSON-Inspired Kernels: 64-bit Bitmap Operations
+// =============================================================================
+
+/**
+ * Create quote bitmap - each thread processes 64 chars into one uint64.
+ * Based on GpJSON create_quote_index.cu
+ *
+ * @param input       Input JSON bytes
+ * @param quote_bits  Output 64-bit quote bitmaps (1 bit per char)
+ * @param quote_carry Quote count parity for cross-chunk carry (0 or 1)
+ * @param size        Total input size in bytes
+ * @param num_chunks  Number of 64-byte chunks
+ */
+[[kernel]] void create_quote_bitmap(
+    device const uint8_t* input [[buffer(0)]],
+    device uint64_t* quote_bits [[buffer(1)]],
+    device uint8_t* quote_carry [[buffer(2)]],
+    constant const uint32_t& size [[buffer(3)]],
+    uint index [[thread_position_in_grid]]
+) {
+    uint64_t base = index * 64;
+    if (base >= size) return;
+
+    uint64_t bitmap = 0;
+    uint8_t quote_count = 0;
+    uint64_t end = min(base + 64, (uint64_t)size);
+
+    // Build quote bitmap for this 64-byte chunk
+    for (uint64_t i = base; i < end; i++) {
+        uint8_t ch = input[i];
+        uint64_t bit_pos = i - base;
+
+        if (ch == '"') {
+            // Check if escaped (previous char is backslash)
+            // Note: For full escape handling, would need escape bitmap first
+            bool escaped = (i > 0 && input[i - 1] == '\\');
+            if (!escaped) {
+                bitmap |= (1UL << bit_pos);
+                quote_count++;
+            }
+        }
+    }
+
+    quote_bits[index] = bitmap;
+    quote_carry[index] = quote_count & 1;  // Parity for carry propagation
+}
+
+/**
+ * Prefix-XOR to convert quote bitmap to string mask.
+ * Based on simdjson/GpJSON algorithm.
+ *
+ * After this: bit=1 means character is INSIDE a string.
+ *
+ * @param quote_bits     Input: quote position bitmaps
+ * @param string_mask    Output: in-string mask (modified in place)
+ * @param quote_carry    Quote parity from previous chunks
+ * @param num_chunks     Number of 64-bit chunks
+ */
+[[kernel]] void create_string_mask(
+    device uint64_t* quote_bits [[buffer(0)]],
+    device const uint8_t* quote_carry [[buffer(1)]],
+    constant const uint32_t& num_chunks [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= num_chunks) return;
+
+    uint64_t quotes = quote_bits[index];
+
+    // Prefix-XOR algorithm (from simdjson)
+    // Transforms: 0b00100100 (quotes at pos 2,5)
+    // Into:       0b00111100 (inside string from 2-5)
+    quotes ^= quotes << 1;
+    quotes ^= quotes << 2;
+    quotes ^= quotes << 4;
+    quotes ^= quotes << 8;
+    quotes ^= quotes << 16;
+    quotes ^= quotes << 32;
+
+    // Handle carry from previous chunks
+    // If previous chunk ended inside string, invert our mask
+    if (index > 0 && quote_carry[index - 1] == 1) {
+        quotes = ~quotes;
+    }
+
+    quote_bits[index] = quotes;  // Now contains string mask
+}
+
+/**
+ * Extract structural character positions, filtering out those inside strings.
+ *
+ * @param input         Input JSON bytes
+ * @param string_mask   64-bit string masks (bit=1 means inside string)
+ * @param output_pos    Output: positions of structural chars
+ * @param output_chars  Output: the structural characters
+ * @param output_count  Atomic counter for output position
+ * @param size          Input size
+ */
+[[kernel]] void extract_structural_positions(
+    device const uint8_t* input [[buffer(0)]],
+    device const uint64_t* string_mask [[buffer(1)]],
+    device uint32_t* output_pos [[buffer(2)]],
+    device uint8_t* output_chars [[buffer(3)]],
+    device atomic_uint* output_count [[buffer(4)]],
+    constant const uint32_t& size [[buffer(5)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= size) return;
+
+    uint8_t ch = input[index];
+    uint8_t cls = CHAR_LOOKUP[ch];
+
+    // Skip non-structural characters
+    if (cls == CHAR_WHITESPACE || cls == CHAR_OTHER || cls == CHAR_BACKSLASH) {
+        return;
+    }
+
+    // Check if inside string using mask
+    uint chunk_idx = index / 64;
+    uint bit_pos = index % 64;
+    uint64_t mask = string_mask[chunk_idx];
+    bool in_string = (mask >> bit_pos) & 1;
+
+    // Quotes mark string boundaries (always structural)
+    // Other structural chars only if outside strings
+    if (cls == CHAR_QUOTE || !in_string) {
+        uint pos = atomic_fetch_add_explicit(output_count, 1, memory_order_relaxed);
+        output_pos[pos] = index;
+        output_chars[pos] = ch;
+    }
+}
+
+/**
+ * NDJSON line detection - find newline positions.
+ * Each thread processes 64 bytes.
+ *
+ * @param input         Input bytes
+ * @param newline_bits  Output: 64-bit newline bitmaps
+ * @param size          Input size
+ */
+[[kernel]] void find_newlines(
+    device const uint8_t* input [[buffer(0)]],
+    device uint64_t* newline_bits [[buffer(1)]],
+    constant const uint32_t& size [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    uint64_t base = index * 64;
+    if (base >= size) return;
+
+    uint64_t bitmap = 0;
+    uint64_t end = min(base + 64, (uint64_t)size);
+
+    for (uint64_t i = base; i < end; i++) {
+        if (input[i] == '\n') {
+            bitmap |= (1UL << (i - base));
+        }
+    }
+
+    newline_bits[index] = bitmap;
+}

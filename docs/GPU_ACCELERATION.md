@@ -222,6 +222,80 @@ For single large JSON documents, parallelization is more complex due to state de
 
 ---
 
+## GpJSON-Inspired Full GPU Stage 1 (2026-01)
+
+After analyzing GpJSON, we've implemented advanced kernels for full GPU Stage 1:
+
+### New Kernel Pipeline
+
+```
+Pass 1: create_quote_bitmap      → 64-bit bitmap of quote positions
+Pass 2: create_string_mask       → Prefix-XOR for in-string tracking
+Pass 3: extract_structural_positions → Filter by string mask
+Pass 4 (NDJSON): find_newlines   → Line boundary detection
+```
+
+### Key Algorithm: Prefix-XOR String Tracking
+
+From simdjson/GpJSON - transforms quote positions to in-string mask:
+
+```metal
+// Input:  0b00100100 (quotes at positions 2 and 5)
+// Output: 0b00111100 (inside string from 2-5)
+
+quotes ^= quotes << 1;
+quotes ^= quotes << 2;
+quotes ^= quotes << 4;
+quotes ^= quotes << 8;
+quotes ^= quotes << 16;
+quotes ^= quotes << 32;
+```
+
+### 64-bit Bitmap Architecture
+
+Each thread processes 64 bytes into a single `uint64_t`:
+- **Memory efficient**: 64x compression vs per-byte classification
+- **Parallel friendly**: Each chunk is independent (with carry)
+- **Cache optimal**: Coalesced memory access patterns
+
+### Carry Propagation
+
+Handles cross-chunk string state:
+```metal
+// If previous chunk ended inside string, invert our mask
+if (index > 0 && quote_carry[index - 1] == 1) {
+    quotes = ~quotes;
+}
+```
+
+### Kernel Files
+
+New kernels in `metal/json_classify.metal`:
+- `create_quote_bitmap` - Build 64-bit quote bitmaps with carry
+- `create_string_mask` - Prefix-XOR transformation
+- `extract_structural_positions` - Atomic extraction with string filtering
+- `find_newlines` - NDJSON line detection
+
+### Build Requirements
+
+```bash
+# Install Metal toolchain first
+xcodebuild -downloadComponent MetalToolchain
+
+# Then rebuild
+cd metal && ./build_all.sh
+```
+
+### Expected Performance (when compiled)
+
+| Operation | Current | With Full GPU Stage 1 |
+|-----------|---------|----------------------|
+| Stage 1a (classification) | 2.5 GB/s | ~3-4 GB/s |
+| Stage 1b (string tracking) | Sequential | Parallel |
+| Overall | 2.5 GB/s | ~4-6 GB/s (est.) |
+
+---
+
 ## Comprehensive Hardware Acceleration Analysis (2026-01)
 
 Deep analysis of all Apple Silicon acceleration options for JSON parsing.
