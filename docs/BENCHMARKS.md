@@ -4,7 +4,7 @@ Comprehensive cross-library JSON parsing benchmarks comparing mojo-json against 
 
 ## Test Environment
 
-- **Hardware**: Apple M3 Ultra (24-core CPU, 76-core GPU, 128GB unified memory)
+- **Hardware**: Apple M3 Ultra (24-core CPU, 76-core GPU, 96GB unified memory)
 - **OS**: macOS Sequoia 15.2
 - **Mojo**: 25.1.0
 - **Test Date**: January 2025
