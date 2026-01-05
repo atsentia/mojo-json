@@ -279,15 +279,17 @@ New kernels in `metal/json_classify.metal`:
 ### Build Requirements
 
 ```bash
-# 1. Install Metal toolchain first (one-time)
-xcodebuild -downloadComponent MetalToolchain
+# Build everything (Metal Toolchain auto-downloads if needed)
+cd metal && ./build_all.sh
+```
 
-# 2. Compile Metal shaders to .metallib
-cd metal
-xcrun metal -c json_classify.metal -o json_classify.air
-xcrun metallib json_classify.air -o json_classify.metallib
+Or manually:
+```bash
+# Compile Metal shaders to .metallib
+xcrun -sdk macosx metal -c json_classify.metal -o json_classify.air
+xcrun -sdk macosx metallib json_classify.air -o json_classify.metallib
 
-# 3. Build C bridge library (already done)
+# Build C bridge library
 clang -shared -fobjc-arc metal_bridge.m -o libmetal_bridge.dylib \
     -framework Metal -framework Foundation
 ```

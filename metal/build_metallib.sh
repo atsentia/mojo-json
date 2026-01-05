@@ -4,6 +4,10 @@
 # Usage: ./build_metallib.sh
 #
 # Outputs: json_classify.metallib
+#
+# Kernels included:
+#   - json_classify_contiguous, json_classify_vec4, json_classify_lookup, json_classify_lookup_vec8
+#   - create_quote_bitmap, create_string_mask, extract_structural_positions, find_newlines
 
 set -e
 
@@ -12,8 +16,14 @@ cd "$SCRIPT_DIR"
 
 echo "Building JSON classification Metal library..."
 
+# Ensure Metal Toolchain is available (downloads if needed)
+if ! xcrun -sdk macosx metal --version &>/dev/null; then
+    echo "Metal Toolchain not found. Downloading via xcodebuild..."
+    xcodebuild -downloadComponent MetalToolchain
+fi
+
 # Metal compiler flags (same as MLX uses)
-METAL_FLAGS="-x metal -Wall -Wextra -fno-fast-math"
+METAL_FLAGS="-Wall -Wextra -fno-fast-math"
 
 # Get macOS deployment target if set
 if [ -n "$MACOSX_DEPLOYMENT_TARGET" ]; then
@@ -35,10 +45,6 @@ echo ""
 echo "Success! Created: json_classify.metallib"
 echo ""
 
-# Show metallib info
-echo "Metal library info:"
-xcrun -sdk macosx metal-nm json_classify.metallib 2>/dev/null || true
-
-echo ""
+# Show kernel functions
 echo "Kernel functions exported:"
-strings json_classify.metallib | grep -E "^json_classify" || echo "  (use metal-nm to inspect)"
+strings json_classify.metallib | grep -E "^(json_classify|create_|extract_|find_)[a-z_]+$" | sort -u
